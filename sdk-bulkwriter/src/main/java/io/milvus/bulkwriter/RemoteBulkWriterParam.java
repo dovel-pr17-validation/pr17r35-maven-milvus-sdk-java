@@ -1,0 +1,272 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+package io.milvus.bulkwriter;
+
+import io.milvus.bulkwriter.common.clientenum.BulkFileType;
+import io.milvus.bulkwriter.common.utils.V2AdapterUtils;
+import io.milvus.bulkwriter.connect.StorageConnectParam;
+import io.milvus.exception.ParamException;
+import io.milvus.param.ParamUtils;
+import io.milvus.param.collection.CollectionSchemaParam;
+import io.milvus.v2.service.collection.request.CreateCollectionReq;
+
+import java.util.HashMap;
+import java.util.Map;
+
+/**
+ * Parameters for <code>bulkWriter</code> interface.
+ */
+
+
+public class RemoteBulkWriterParam {
+    private final CreateCollectionReq.CollectionSchema collectionSchema;
+    private final StorageConnectParam connectParam;
+    private final String remotePath;
+    private final long chunkSize;
+    private final BulkFileType fileType;
+    private final Map<String, Object> config;
+
+    private RemoteBulkWriterParam(Builder builder) {
+        this.collectionSchema = builder.collectionSchema;
+        this.connectParam = builder.connectParam;
+        this.remotePath = builder.remotePath;
+        this.chunkSize = builder.chunkSize;
+        this.fileType = builder.fileType;
+        this.config = builder.config;
+    }
+
+    /**
+    * Returns the collection schema.
+    *
+    * @return the collection schema
+    */
+
+
+    public CreateCollectionReq.CollectionSchema getCollectionSchema() {
+        return collectionSchema;
+    }
+
+    /**
+    * Returns the cloud storage connection parameters.
+    *
+    * @return the cloud storage connection parameters
+    */
+
+
+    public StorageConnectParam getConnectParam() {
+        return connectParam;
+    }
+
+    /**
+    * Returns the remote path where data files are uploaded.
+    *
+    * @return the remote path where data files are uploaded
+    */
+
+
+    public String getRemotePath() {
+        return remotePath;
+    }
+
+    /**
+    * Returns the chunk size threshold in bytes.
+    *
+    * @return the chunk size threshold in bytes
+    */
+
+
+    public long getChunkSize() {
+        return chunkSize;
+    }
+
+    /**
+    * Returns the bulk data file type.
+    *
+    * @return the bulk data file type
+    */
+
+
+    public BulkFileType getFileType() {
+        return fileType;
+    }
+
+    /**
+    * Returns the writer configuration map.
+    *
+    * @return the writer configuration map
+    */
+
+
+    public Map<String, Object> getConfig() {
+        return config;
+    }
+
+    @Override
+    public String toString() {
+        return "RemoteBulkWriterParam{" +
+                "collectionSchema=" + collectionSchema +
+                ", remotePath='" + remotePath + '\'' +
+                ", chunkSize=" + chunkSize +
+                ", fileType=" + fileType +
+                '}';
+    }
+    /**
+     * Creates a new builder.
+     *
+     * @return the builder
+     */
+
+
+    public static Builder newBuilder() {
+        return new Builder();
+    }
+
+    /**
+     * Builder for {@link RemoteBulkWriterParam} class.
+     */
+
+
+    public static final class Builder {
+        private CreateCollectionReq.CollectionSchema collectionSchema;
+        private StorageConnectParam connectParam;
+        private String remotePath;
+        private long chunkSize = 128 * 1024 * 1024;
+        private BulkFileType fileType = BulkFileType.PARQUET;
+        private final Map<String, Object> config = new HashMap<>();
+
+        private Builder() {
+        }
+
+        /**
+         * Sets the collection info.
+         *
+         * @param collectionSchema collection info
+         * @return <code>Builder</code>
+         */
+
+
+        public Builder withCollectionSchema(CollectionSchemaParam collectionSchema) {
+            this.collectionSchema = V2AdapterUtils.convertV1Schema(collectionSchema);
+            return this;
+        }
+
+        /**
+         * Sets the collection schema by V2.
+         *
+         * @param collectionSchema collection schema
+         * @return <code>Builder</code>
+         */
+
+
+        public Builder withCollectionSchema(CreateCollectionReq.CollectionSchema collectionSchema) {
+            this.collectionSchema = collectionSchema;
+            return this;
+        }
+
+        /**
+        * Sets the cloud storage connection parameters.
+        *
+        * @param connectParam the cloud storage connection parameters
+        * @return this builder
+        */
+
+
+        public Builder withConnectParam(StorageConnectParam connectParam) {
+            this.connectParam = connectParam;
+            return this;
+        }
+
+        /**
+        * Sets the remote path where data files are uploaded.
+        *
+        * @param remotePath the remote path where data files are uploaded
+        * @return this builder
+        */
+
+
+        public Builder withRemotePath(String remotePath) {
+            this.remotePath = remotePath;
+            return this;
+        }
+
+        /**
+        * Sets the chunk size threshold in bytes.
+        *
+        * @param chunkSize the chunk size threshold in bytes
+        * @return this builder
+        */
+
+
+        public Builder withChunkSize(long chunkSize) {
+            this.chunkSize = chunkSize;
+            return this;
+        }
+
+        /**
+        * Sets the bulk data file type.
+        *
+        * @param fileType the bulk data file type
+        * @return this builder
+        */
+
+
+        public Builder withFileType(BulkFileType fileType) {
+            this.fileType = fileType;
+            return this;
+        }
+
+        /**
+        * Sets a writer configuration entry.
+        *
+        * @param key a writer configuration entry
+        * @param val the value
+        * @return this builder
+        */
+
+
+        public Builder withConfig(String key, Object val) {
+            this.config.put(key, val);
+            return this;
+        }
+
+        /**
+         * Verifies parameters and creates a new {@link RemoteBulkWriterParam} instance.
+         *
+         * @return {@link RemoteBulkWriterParam}
+         * @throws ParamException if the required parameters are invalid
+         */
+
+
+        public RemoteBulkWriterParam build() throws ParamException {
+            ParamUtils.CheckNullEmptyString(remotePath, "localPath");
+
+            if (collectionSchema == null) {
+                throw new ParamException("collectionSchema cannot be null");
+            }
+
+            if (connectParam == null) {
+                throw new ParamException("connectParam cannot be null");
+            }
+
+            return new RemoteBulkWriterParam(this);
+        }
+    }
+
+}

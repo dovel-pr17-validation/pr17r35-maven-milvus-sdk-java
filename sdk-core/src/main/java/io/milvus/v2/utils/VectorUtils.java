@@ -1,0 +1,953 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+package io.milvus.v2.utils;
+
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
+import com.google.gson.reflect.TypeToken;
+import com.google.protobuf.ByteString;
+import io.milvus.common.utils.cache.CollectionTsCache;
+import io.milvus.common.utils.JsonUtils;
+import io.milvus.exception.ParamException;
+import io.milvus.grpc.*;
+import io.milvus.param.Constant;
+import io.milvus.param.ParamUtils;
+import io.milvus.v2.common.ConsistencyLevel;
+import io.milvus.v2.exception.ErrorCode;
+import io.milvus.v2.exception.MilvusClientException;
+import io.milvus.v2.service.collection.request.CreateCollectionReq;
+import io.milvus.v2.service.vector.request.*;
+import io.milvus.v2.service.vector.request.FunctionScore;
+import io.milvus.v2.service.vector.request.aggregation.OrderByField;
+import io.milvus.v2.service.vector.request.aggregation.SearchAggregation;
+import io.milvus.v2.service.vector.request.data.BaseVector;
+import io.milvus.v2.service.vector.request.highlighter.Highlighter;
+import io.milvus.v2.service.vector.request.ranker.RRFRanker;
+import io.milvus.v2.service.vector.request.ranker.WeightedRanker;
+import org.apache.commons.collections4.CollectionUtils;
+import org.apache.commons.lang3.StringUtils;
+
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.stream.Collectors;
+
+/**
+ * Utility class used internally by the Milvus Java SDK v2 to convert query, search, and hybrid
+ * search requests into the gRPC protobuf requests sent to the Milvus server.
+ *
+ * <p>Also provides helpers for building filter expression template values and primary key filter
+ * expressions.</p>
+ */
+
+
+public class VectorUtils {
+    private String endpoint = "";
+    private String currentDbName;
+
+    /**
+     * Constructs a new {@code VectorUtils}.
+     */
+
+
+    public VectorUtils() {
+    }
+
+    /**
+     * Sets the server endpoint, used to look up the session guarantee timestamp from the collection
+     * timestamp cache.
+     *
+     * @param endpoint the server endpoint
+     */
+
+
+    public void setEndpoint(String endpoint) {
+        this.endpoint = endpoint == null ? "" : endpoint;
+    }
+
+    /**
+     * Sets the current database name.
+     *
+     * @param currentDbName the current database name
+     */
+
+
+    public void setCurrentDbName(String currentDbName) {
+        this.currentDbName = currentDbName;
+    }
+
+    /**
+     * Converts an SDK v2 {@link QueryReq} into a gRPC {@link QueryRequest}.
+     *
+     * <p>Maps the filter expression, partition names, output fields, consistency level, query
+     * parameters, offset, limit, order-by and group-by fields, and timezone onto the gRPC request.
+     * A null consistency level enables the server default.</p>
+     *
+     * @param request the SDK v2 query request
+     * @return the gRPC query request
+     * @throws NullPointerException if {@code request} is null
+     * @throws MilvusClientException if a filter expression template value has an unsupported type
+     */
+
+
+    public QueryRequest ConvertToGrpcQueryRequest(QueryReq request) {
+        if (request == null) {
+            throw new NullPointerException("request cannot be null");
+        }
+        String dbName = request.getDatabaseName();
+        String collectionName = request.getCollectionName();
+        long guaranteeTimestamp = getGuaranteeTimestamp(request.getConsistencyLevel(), dbName, collectionName);
+        QueryRequest.Builder builder = QueryRequest.newBuilder()
+                .setCollectionName(collectionName)
+                .addAllPartitionNames(request.getPartitionNames())
+                .addAllOutputFields(request.getOutputFields())
+                .setGuaranteeTimestamp(guaranteeTimestamp)
+                .setExpr(request.getFilter());
+        if (StringUtils.isNotEmpty(dbName)) {
+            builder.setDbName(dbName);
+        }
+
+        if (StringUtils.isNotEmpty(request.getRlsPrincipal())) {
+            builder.setRlsPrincipal(request.getRlsPrincipal());
+        }
+        if (request.getSkipRls() != null) {
+            builder.setSkipRls(request.getSkipRls());
+        }
+
+        if (StringUtils.isNotEmpty(request.getFilter())) {
+            Map<String, Object> filterTemplateValues = request.getFilterTemplateValues();
+            filterTemplateValues.forEach((key, value) -> {
+                builder.putExprTemplateValues(key, deduceAndCreateTemplateValue(value));
+            });
+        }
+
+        // a new parameter from v2.2.9, if user didn't specify consistency level, set this parameter to true
+        if (request.getConsistencyLevel() == null) {
+            builder.setUseDefaultConsistency(true);
+        } else {
+            builder.setConsistencyLevelValue(request.getConsistencyLevel().getCode());
+        }
+
+        // extra parameters
+        Map<String, Object> queryParams = request.getQueryParams();
+        queryParams.forEach((key, value) -> {
+            // for new versions, all keys are in the top level
+            builder.addQueryParams(KeyValuePair.newBuilder()
+                    .setKey(key)
+                    .setValue(String.valueOf(value))
+                    .build());
+        });
+
+        // set offset and limit value.
+        // directly pass the two values, the server will verify them.
+        long offset = request.getOffset();
+        if (offset > 0) {
+            builder.addQueryParams(KeyValuePair.newBuilder()
+                    .setKey(Constant.OFFSET)
+                    .setValue(String.valueOf(offset))
+                    .build());
+        }
+
+        long limit = request.getLimit();
+        if (limit > 0) {
+            builder.addQueryParams(KeyValuePair.newBuilder()
+                    .setKey(Constant.LIMIT)
+                    .setValue(String.valueOf(limit))
+                    .build());
+        }
+
+        // ignore growing
+        builder.addQueryParams(KeyValuePair.newBuilder()
+                .setKey(Constant.IGNORE_GROWING)
+                .setValue(String.valueOf(request.isIgnoreGrowing()))
+                .build());
+
+        // timezone
+        if (StringUtils.isNotEmpty(request.getTimezone())) {
+            builder.addQueryParams(KeyValuePair.newBuilder()
+                    .setKey(Constant.TIMEZONE)
+                    .setValue(request.getTimezone())
+                    .build());
+        }
+
+        if (CollectionUtils.isNotEmpty(request.getOrderByFields())) {
+            builder.addQueryParams(KeyValuePair.newBuilder()
+                    .setKey(Constant.ORDER_BY_FIELDS)
+                    .setValue(formatOrderByFields(request.getOrderByFields()))
+                    .build());
+        }
+
+        // group-by fields, sent as a comma-separated list like the pymilvus client
+        if (CollectionUtils.isNotEmpty(request.getGroupByFields())) {
+            builder.addQueryParams(KeyValuePair.newBuilder()
+                    .setKey(Constant.GROUP_BY_FIELDS)
+                    .setValue(String.join(",", request.getGroupByFields()))
+                    .build());
+        }
+
+        return builder.build();
+
+    }
+
+    private long getGuaranteeTimestamp(ConsistencyLevel consistencyLevel, String dbName, String collectionName) {
+        String cacheDbName = StringUtils.isNotEmpty(dbName) ? dbName : currentDbName;
+        if (consistencyLevel == null) {
+            long ts = StringUtils.isNotBlank(endpoint)
+                    ? CollectionTsCache.getInstance().get(endpoint, cacheDbName, collectionName) : 0L;
+            return ts == 0L ? 1L : ts;
+        }
+        switch (consistencyLevel) {
+            case STRONG:
+                return 0L;
+            case SESSION: {
+                long ts = StringUtils.isNotBlank(endpoint)
+                        ? CollectionTsCache.getInstance().get(endpoint, cacheDbName, collectionName) : 0L;
+                return ts == 0L ? 1L : ts;
+            }
+            case BOUNDED:
+                return 2L; // let server side to determine the bounded time
+            default:
+                return 1L; // EVENTUALLY and others
+        }
+    }
+
+    private static String formatOrderByFields(List<OrderByField> orderByFields) {
+        return orderByFields.stream()
+                .map(item -> item.getFieldName() + ":" + item.getDirection().getValue())
+                .collect(Collectors.joining(","));
+    }
+
+    private static ByteString convertPlaceholder(List<Object> data, PlaceholderType placeType, boolean elementLevel) {
+        if (placeType == PlaceholderType.VarChar) {
+            List<ByteString> byteStrings = new ArrayList<>();
+            for (Object obj : data) {
+                byteStrings.add(ByteString.copyFrom(((String) obj).getBytes()));
+            }
+            PlaceholderValue.Builder pldBuilder = PlaceholderValue.newBuilder()
+                    .setTag(Constant.VECTOR_TAG)
+                    .setType(placeType)
+                    .setElementLevel(elementLevel);
+            byteStrings.forEach(pldBuilder::addValues);
+
+            PlaceholderValue plv = pldBuilder.build();
+            PlaceholderGroup placeholderGroup = PlaceholderGroup.newBuilder()
+                    .addPlaceholders(plv)
+                    .build();
+            return placeholderGroup.toByteString();
+        } else {
+            try {
+                return ParamUtils.convertPlaceholder(data, placeType, elementLevel);
+            } catch (ParamException e) {
+                throw new MilvusClientException(ErrorCode.INVALID_PARAMS, e.getMessage());
+            }
+        }
+    }
+
+    private static void convertSearchTarget(SearchReq request, SearchRequest.Builder builder, boolean elementLevel) {
+        // prepare target, the input could be:
+        // 1. vectors or string list for doc-in-doc-out
+        // 2. ids list for search by primary keys
+        List<BaseVector> vectors = request.getData();
+        List<Object> ids = request.getIds();
+        boolean vectorsIsEmpty = CollectionUtils.isEmpty(vectors);
+        boolean idsIsEmpty = CollectionUtils.isEmpty(ids);
+        if (vectorsIsEmpty && idsIsEmpty) {
+            throw new MilvusClientException(ErrorCode.INVALID_PARAMS, "Require either ids or vectors, but both are empty");
+        }
+        if (!vectorsIsEmpty && !idsIsEmpty) {
+            throw new MilvusClientException(ErrorCode.INVALID_PARAMS, "Require either ids or vectors, but both are provided");
+        }
+
+        if (!vectorsIsEmpty) {
+            // the elements must be all-vector or all-string
+            PlaceholderType plType = vectors.get(0).getPlaceholderType();
+            List<Object> data = new ArrayList<>();
+            for (BaseVector vector : vectors) {
+                if (vector.getPlaceholderType() != plType) {
+                    throw new MilvusClientException(ErrorCode.INVALID_PARAMS,
+                            "Different types of target vectors in a search request is not allowed.");
+                }
+                data.add(vector.getData());
+            }
+
+            ByteString byteStr = convertPlaceholder(data, plType, elementLevel);
+            builder.setPlaceholderGroup(byteStr);
+            builder.setNq(vectors.size());
+        } else {
+            Object val = ids.get(0);
+            if (val instanceof String) {
+                StringArray.Builder strBuilder = StringArray.newBuilder();
+                for (Object obj : ids) {
+                    if (!(obj instanceof String)) {
+                        throw new MilvusClientException(ErrorCode.INVALID_PARAMS,
+                                "All IDs must be of type String if the first ID is a String.");
+                    }
+                    strBuilder.addData((String) obj);
+                }
+                builder.setIds(IDs.newBuilder().setStrId(strBuilder.build()).build());
+            } else if (val instanceof Long) {
+                LongArray.Builder longBuilder = LongArray.newBuilder();
+                for (Object obj : ids) {
+                    if (!(obj instanceof Long)) {
+                        throw new MilvusClientException(ErrorCode.INVALID_PARAMS,
+                                "All IDs must be of type Long if the first ID is a Long.");
+                    }
+                    longBuilder.addData((Long) obj);
+                }
+                builder.setIds(IDs.newBuilder().setIntId(longBuilder.build()).build());
+            } else {
+                throw new MilvusClientException(ErrorCode.INVALID_PARAMS, "ID type must be String or Long.");
+            }
+            builder.setNq(ids.size());
+        }
+    }
+
+    /**
+     * Converts an SDK v2 {@link SearchReq} into a gRPC {@link SearchRequest}.
+     *
+     * <p>Maps the search targets (vectors or IDs), filter expression, search parameters, output
+     * fields, consistency level, ranker/function score, function chains, and highlighter onto the
+     * gRPC request. A null consistency level enables the server default.</p>
+     *
+     * @param request the SDK v2 search request
+     * @return the gRPC search request
+     * @throws MilvusClientException if the limit is not positive, round_decimal is out of range,
+     *                               or the search targets are invalid
+     */
+
+
+    public SearchRequest ConvertToGrpcSearchRequest(SearchReq request) {
+        if (request.getLimit() <= 0) {
+            throw new MilvusClientException(ErrorCode.INVALID_PARAMS,
+                    "Search limit must be a positive integer, got: " + request.getLimit());
+        }
+        if (request.getRoundDecimal() <= -2 || request.getRoundDecimal() >= 7) {
+            throw new MilvusClientException(ErrorCode.INVALID_PARAMS,
+                    "round_decimal must be in (-2, 7), got: " + request.getRoundDecimal());
+        }
+        String dbName = request.getDatabaseName();
+        String collectionName = request.getCollectionName();
+        SearchRequest.Builder builder = SearchRequest.newBuilder()
+                .setCollectionName(collectionName);
+        if (!request.getPartitionNames().isEmpty()) {
+            request.getPartitionNames().forEach(builder::addPartitionNames);
+        }
+
+        if (StringUtils.isNotEmpty(dbName)) {
+            builder.setDbName(dbName);
+        }
+
+        if (StringUtils.isNotEmpty(request.getRlsPrincipal())) {
+            builder.setRlsPrincipal(request.getRlsPrincipal());
+        }
+        if (request.getSkipRls() != null) {
+            builder.setSkipRls(request.getSkipRls());
+        }
+
+        // target vectors or ids
+        String filter = request.getFilter();
+        boolean elementLevel = filter != null && filter.contains("element_filter");
+        convertSearchTarget(request, builder, elementLevel);
+
+        // search parameters
+        // tries to fit the compatibility between v2.5.1 and older versions
+        Map<String, Object> searchParams = request.getSearchParams();
+        ParamUtils.compatibleSearchParams(searchParams, builder);
+
+        // the following parameters are not changed
+        // just note: if the searchParams already contains the same key, the following parameters will overwrite it
+        if (StringUtils.isNotEmpty(request.getAnnsField())) {
+            builder.addSearchParams(
+                    KeyValuePair.newBuilder()
+                            .setKey(Constant.VECTOR_FIELD)
+                            .setValue(request.getAnnsField())
+                            .build());
+        }
+
+        // topK value is deprecated, always use "limit" to set the topK
+        builder.addSearchParams(
+                        KeyValuePair.newBuilder()
+                                .setKey(Constant.TOP_K)
+                                .setValue(String.valueOf(request.getLimit()))
+                                .build())
+                .addSearchParams(
+                        KeyValuePair.newBuilder()
+                                .setKey(Constant.ROUND_DECIMAL)
+                                .setValue(String.valueOf(request.getRoundDecimal()))
+                                .build())
+                .addSearchParams(
+                        KeyValuePair.newBuilder()
+                                .setKey(Constant.IGNORE_GROWING)
+                                .setValue(String.valueOf(request.isIgnoreGrowing()))
+                                .build())
+                .addSearchParams(
+                        KeyValuePair.newBuilder()
+                                .setKey(Constant.OFFSET)
+                                .setValue(String.valueOf(request.getOffset()))
+                                .build());
+
+        if (null != request.getMetricType()) {
+            builder.addSearchParams(
+                    KeyValuePair.newBuilder()
+                            .setKey(Constant.METRIC_TYPE)
+                            .setValue(request.getMetricType().name())
+                            .build());
+        }
+
+        // timezone
+        if (StringUtils.isNotEmpty(request.getTimezone())) {
+            builder.addSearchParams(
+                    KeyValuePair.newBuilder()
+                            .setKey(Constant.TIMEZONE)
+                            .setValue(request.getTimezone())
+                            .build());
+        }
+
+        if (CollectionUtils.isNotEmpty(request.getOrderByFields())) {
+            builder.addSearchParams(
+                    KeyValuePair.newBuilder()
+                            .setKey(Constant.ORDER_BY_FIELDS)
+                            .setValue(formatOrderByFields(request.getOrderByFields()))
+                            .build());
+        }
+
+        SearchAggregation searchAggregation = request.getSearchAggregation();
+        if (request.getGroupByFieldName() != null && !request.getGroupByFieldName().isEmpty()) {
+            if (searchAggregation != null) {
+                throw new MilvusClientException(ErrorCode.INVALID_PARAMS,
+                        "Cannot set both groupByFieldName and searchAggregation.");
+            }
+            builder.addSearchParams(
+                    KeyValuePair.newBuilder()
+                            .setKey(Constant.GROUP_BY_FIELD)
+                            .setValue(request.getGroupByFieldName())
+                            .build());
+            if (request.getGroupSize() != null) {
+                builder.addSearchParams(
+                        KeyValuePair.newBuilder()
+                                .setKey(Constant.GROUP_SIZE)
+                                .setValue(request.getGroupSize().toString())
+                                .build());
+            }
+
+            if (request.getStrictGroupSize() != null) {
+                builder.addSearchParams(
+                        KeyValuePair.newBuilder()
+                                .setKey(Constant.STRICT_GROUP_SIZE)
+                                .setValue(request.getStrictGroupSize().toString())
+                                .build());
+            }
+        }
+
+        if (searchAggregation != null) {
+            builder.setSearchAggregation(searchAggregation.toProto());
+        }
+
+        if (!request.getOutputFields().isEmpty()) {
+            request.getOutputFields().forEach(builder::addOutputFields);
+        }
+
+        // always use expression since dsl is discarded
+        builder.setDslType(DslType.BoolExprV1);
+        if (request.getFilter() != null && !request.getFilter().isEmpty()) {
+            builder.setDsl(request.getFilter());
+            Map<String, Object> filterTemplateValues = request.getFilterTemplateValues();
+            filterTemplateValues.forEach((key, value) -> {
+                builder.putExprTemplateValues(key, deduceAndCreateTemplateValue(value));
+            });
+        }
+
+        // the SearchIteratorV2 passes a guaranteeTimestamp value, no need to call getGuaranteeTimestamp()
+        if (request.getSearchParams().containsKey("iterator")) {
+            long guaranteeTimestamp = 0;
+            if (request.getSearchParams().containsKey("guarantee_timestamp")) {
+                guaranteeTimestamp = ((Number) request.getSearchParams().get("guarantee_timestamp")).longValue();
+            }
+            builder.setGuaranteeTimestamp(guaranteeTimestamp);
+        } else {
+            long guaranteeTimestamp = getGuaranteeTimestamp(request.getConsistencyLevel(), dbName, collectionName);
+            builder.setGuaranteeTimestamp(guaranteeTimestamp);
+        }
+
+        // a new parameter from v2.2.9, if user didn't specify consistency level, set this parameter to true
+        if (request.getConsistencyLevel() == null) {
+            builder.setUseDefaultConsistency(true);
+        } else {
+            builder.setConsistencyLevelValue(request.getConsistencyLevel().getCode());
+        }
+
+        // set ranker, support reranking search result from v2.6.1
+        CreateCollectionReq.Function ranker = request.getRanker();
+        io.milvus.v2.service.vector.request.FunctionScore functionScore = request.getFunctionScore();
+        if (ranker != null && functionScore != null) {
+            throw new MilvusClientException(ErrorCode.INVALID_PARAMS, "Not allow to set both ranker and functionScore.");
+        }
+        if (functionScore != null) {
+            builder.setFunctionScore(convertFunctionScore(functionScore));
+        } else if (ranker != null) {
+            builder.setFunctionScore(convertOneFunction(ranker));
+        }
+
+        // set function chains, mutually exclusive with ranker/functionScore
+        List<io.milvus.v2.service.vector.request.FunctionChain> functionChains = request.getFunctionChains();
+        if (functionChains != null && !functionChains.isEmpty()) {
+            if (ranker != null || functionScore != null) {
+                throw new MilvusClientException(ErrorCode.INVALID_PARAMS,
+                        "Not allowed to set functionChains together with ranker/functionScore.");
+            }
+            for (io.milvus.v2.service.vector.request.FunctionChain chain : functionChains) {
+                if (chain == null) {
+                    throw new MilvusClientException(ErrorCode.INVALID_PARAMS,
+                            "Function chain must not be null");
+                }
+                if (chain.getStage() == io.milvus.v2.service.vector.request.FunctionChainStage.UNSPECIFIED) {
+                    throw new MilvusClientException(ErrorCode.INVALID_PARAMS,
+                            "UNSPECIFIED function chain stage is not supported for search");
+                }
+                builder.addFunctionChains(chain.toGrpc());
+            }
+        }
+
+        // set highlighter
+        Highlighter highlighter = request.getHighlighter();
+        if (highlighter != null) {
+            io.milvus.grpc.Highlighter.Builder hlBuilder = io.milvus.grpc.Highlighter.newBuilder()
+                    .setType(HighlightType.valueOf(highlighter.highlightType()));
+            Map<String, String> hlParams = highlighter.getParams();
+            hlParams.forEach((key, value) -> {
+                hlBuilder.addParams(
+                        KeyValuePair.newBuilder()
+                                .setKey(key)
+                                .setValue(value)
+                                .build());
+            });
+            builder.setHighlighter(hlBuilder.build());
+        }
+
+        return builder.build();
+    }
+
+    private static TemplateArrayValue deduceTemplateArray(List<?> array) {
+        if (array.isEmpty()) {
+            return TemplateArrayValue.newBuilder().build(); // an empty list?
+        }
+
+        Object firstObj = array.get(0);
+        if (firstObj instanceof Boolean) {
+            BoolArray.Builder builder = BoolArray.newBuilder();
+            array.forEach(val -> {
+                if (!(val instanceof Boolean)) {
+                    throw new MilvusClientException(ErrorCode.INVALID_PARAMS,
+                            "Filter expression template is a list, the first value is Boolean, but some elements are not Boolean");
+                }
+                builder.addData((Boolean) val);
+            });
+            return TemplateArrayValue.newBuilder().setBoolData(builder.build()).build();
+        } else if (firstObj instanceof Integer || firstObj instanceof Long) {
+            LongArray.Builder builder = LongArray.newBuilder();
+            array.forEach(val -> {
+                if (!(val instanceof Integer) && !(val instanceof Long)) {
+                    throw new MilvusClientException(ErrorCode.INVALID_PARAMS,
+                            "Filter expression template is a list, the first value is Integer/Long, but some elements are not Integer/Long");
+                }
+                builder.addData((val instanceof Integer) ? (Integer) val : (Long) val);
+            });
+            return TemplateArrayValue.newBuilder().setLongData(builder.build()).build();
+        } else if (firstObj instanceof Double) {
+            DoubleArray.Builder builder = DoubleArray.newBuilder();
+            array.forEach(val -> {
+                if (!(val instanceof Double)) {
+                    throw new MilvusClientException(ErrorCode.INVALID_PARAMS,
+                            "Filter expression template is a list, the first value is Double, but some elements are not Double");
+                }
+                builder.addData((Double) val);
+            });
+            return TemplateArrayValue.newBuilder().setDoubleData(builder.build()).build();
+        } else if (firstObj instanceof String) {
+            StringArray.Builder builder = StringArray.newBuilder();
+            array.forEach(val -> {
+                if (!(val instanceof String)) {
+                    throw new MilvusClientException(ErrorCode.INVALID_PARAMS,
+                            "Filter expression template is a list, the first value is String, but some elements are not String");
+                }
+                builder.addData((String) val);
+            });
+            return TemplateArrayValue.newBuilder().setStringData(builder.build()).build();
+        } else if (firstObj instanceof JsonElement) {
+            JSONArray.Builder builder = JSONArray.newBuilder();
+            array.forEach(val -> {
+                if (!(val instanceof JsonElement)) {
+                    throw new MilvusClientException(ErrorCode.INVALID_PARAMS,
+                            "Filter expression template is a list, the first value is JsonElement, but some elements are not JsonElement");
+                }
+                String str = JsonUtils.toJson((JsonElement) val);
+                builder.addData(ByteString.copyFromUtf8(str));
+            });
+            return TemplateArrayValue.newBuilder().setJsonData(builder.build()).build();
+        } else if (firstObj instanceof List) {
+            TemplateArrayValueArray.Builder builder = TemplateArrayValueArray.newBuilder();
+            array.forEach(val -> {
+                if (!(val instanceof List)) {
+                    throw new MilvusClientException(ErrorCode.INVALID_PARAMS,
+                            "Filter expression template is a list, the first value is List, but some elements are not List");
+                }
+                List<?> subArrary = (List<?>) val;
+                builder.addData(deduceTemplateArray(subArrary));
+            });
+
+            return TemplateArrayValue.newBuilder().setArrayData(builder.build()).build();
+        } else {
+            throw new MilvusClientException(ErrorCode.INVALID_PARAMS,
+                    "Unsupported value type for filter expression template.");
+        }
+    }
+
+    /**
+     * Deduces the gRPC template value type from a Java value and creates the corresponding
+     * {@link TemplateValue}.
+     *
+     * <p>Supported types are {@link Boolean}, {@link Integer}/{@link Long}, {@link Double},
+     * {@link String}, {@code byte[]}, and {@link List}. Lists are converted recursively into
+     * template array values.</p>
+     *
+     * @param value the value used as a filter expression template parameter
+     * @return the gRPC template value
+     * @throws MilvusClientException if the value type is not supported
+     */
+
+
+    public static TemplateValue deduceAndCreateTemplateValue(Object value) {
+        if (value instanceof Boolean) {
+            return TemplateValue.newBuilder()
+                    .setBoolVal((Boolean) value)
+                    .build();
+        } else if (value instanceof Integer || value instanceof Long) {
+            return TemplateValue.newBuilder()
+                    .setInt64Val((value instanceof Integer) ? (Integer) value : (Long) value)
+                    .build();
+        } else if (value instanceof Double) {
+            return TemplateValue.newBuilder()
+                    .setFloatVal((Double) value)
+                    .build();
+        } else if (value instanceof String) {
+            return TemplateValue.newBuilder()
+                    .setStringVal((String) value)
+                    .build();
+        } else if (value instanceof byte[]) {
+            // A client pre-built filter blob (see BloomFilterUtils) travels as raw bytes:
+            // proto3 bytes has no UTF-8 constraint, so a multi-MB blob rides the wire with
+            // zero base64 inflation.
+            return TemplateValue.newBuilder()
+                    .setBytesVal(ByteString.copyFrom((byte[]) value))
+                    .build();
+        } else if (value instanceof List) {
+            List<?> array = (List<?>) value;
+            TemplateArrayValue tav = deduceTemplateArray(array);
+            return TemplateValue.newBuilder()
+                    .setArrayVal(tav)
+                    .build();
+        } else {
+            throw new MilvusClientException(ErrorCode.INVALID_PARAMS,
+                    "Unsupported value type for filter expression template.");
+        }
+    }
+
+    /**
+     * Converts an {@link AnnSearchReq} into a gRPC {@link SearchRequest}.
+     *
+     * <p>Maps the target vectors, search parameters, filter expression, metric type, and
+     * consistency level onto the gRPC request. A null consistency level enables the server
+     * default.</p>
+     *
+     * @param annSearchReq     the ANN search request
+     * @param consistencyLevel the consistency level to apply, may be {@code null}
+     * @return the gRPC search request
+     * @throws NullPointerException if {@code annSearchReq} is null
+     * @throws MilvusClientException if the target vector list is empty or mixes vector types
+     */
+
+
+    public static SearchRequest convertAnnSearchParam(AnnSearchReq annSearchReq,
+                                                      ConsistencyLevel consistencyLevel) {
+        if (annSearchReq == null) {
+            throw new NullPointerException("annSearchReq cannot be null");
+        }
+        SearchRequest.Builder builder = SearchRequest.newBuilder();
+        // prepare target vectors
+        List<BaseVector> vectors = annSearchReq.getVectors();
+        if (vectors.isEmpty()) {
+            throw new MilvusClientException(ErrorCode.INVALID_PARAMS,
+                    "Target vectors list of search request is empty.");
+        }
+        PlaceholderType plType = vectors.get(0).getPlaceholderType();
+        List<Object> data = new ArrayList<>();
+        for (BaseVector vector : vectors) {
+            if (vector.getPlaceholderType() != plType) {
+                throw new MilvusClientException(ErrorCode.INVALID_PARAMS,
+                        "Different types of target vectors in a search request is not allowed.");
+            }
+            data.add(vector.getData());
+        }
+
+        ByteString byteStr = convertPlaceholder(data, plType, false);
+        builder.setPlaceholderGroup(byteStr);
+        builder.setNq(vectors.size());
+
+        // search parameters
+        // tries to fit the compatibility between v2.5.1 and older versions
+        Map<String, Object> paramMap = new HashMap<>();
+        if (null != annSearchReq.getParams() && !annSearchReq.getParams().isEmpty()) {
+            paramMap = JsonUtils.fromJson(annSearchReq.getParams(), new TypeToken<Map<String, Object>>() {
+            }.getType());
+        }
+        ParamUtils.compatibleSearchParams(paramMap, builder);
+
+        builder.addSearchParams(
+                        KeyValuePair.newBuilder()
+                                .setKey(Constant.VECTOR_FIELD)
+                                .setValue(annSearchReq.getVectorFieldName())
+                                .build())
+                .addSearchParams(
+                        KeyValuePair.newBuilder()
+                                .setKey(Constant.TOP_K)
+                                .setValue(String.valueOf(annSearchReq.getLimit()))
+                                .build());
+        if (annSearchReq.getMetricType() != null) {
+            builder.addSearchParams(
+                    KeyValuePair.newBuilder()
+                            .setKey(Constant.METRIC_TYPE)
+                            .setValue(annSearchReq.getMetricType().name())
+                            .build());
+        }
+
+        // timezone
+        if (StringUtils.isNotEmpty(annSearchReq.getTimezone())) {
+            builder.addSearchParams(
+                    KeyValuePair.newBuilder()
+                            .setKey(Constant.TIMEZONE)
+                            .setValue(annSearchReq.getTimezone())
+                            .build());
+        }
+
+        // always use expression since dsl is discarded
+        builder.setDslType(DslType.BoolExprV1);
+        if (annSearchReq.getExpr() != null && !annSearchReq.getExpr().isEmpty()) {
+            builder.setDsl(annSearchReq.getExpr());
+            Map<String, Object> filterTemplateValues = annSearchReq.getFilterTemplateValues();
+            filterTemplateValues.forEach((key, value) -> {
+                builder.putExprTemplateValues(key, deduceAndCreateTemplateValue(value));
+            });
+        }
+
+        if (consistencyLevel == null) {
+            builder.setUseDefaultConsistency(true);
+        } else {
+            builder.setConsistencyLevelValue(consistencyLevel.getCode());
+        }
+
+        return builder.build();
+    }
+
+    /**
+     * Converts an SDK v2 {@link HybridSearchReq} into a gRPC {@link HybridSearchRequest}.
+     *
+     * <p>Converts each sub-request via {@link #convertAnnSearchParam(AnnSearchReq, ConsistencyLevel)}
+     * and maps the ranker/function score, group-by settings, output fields, and consistency level
+     * onto the gRPC request. A null consistency level enables the server default.</p>
+     *
+     * @param request the SDK v2 hybrid search request
+     * @return the gRPC hybrid search request
+     * @throws MilvusClientException if the limit is not positive, round_decimal is out of range,
+     *                               the sub-request list is empty, or both a ranker and a function
+     *                               score are set
+     */
+
+
+    public HybridSearchRequest ConvertToGrpcHybridSearchRequest(HybridSearchReq request) {
+        if (request.getLimit() <= 0) {
+            throw new MilvusClientException(ErrorCode.INVALID_PARAMS,
+                    "Search limit must be a positive integer, got: " + request.getLimit());
+        }
+        if (request.getRoundDecimal() <= -2 || request.getRoundDecimal() >= 7) {
+            throw new MilvusClientException(ErrorCode.INVALID_PARAMS,
+                    "round_decimal must be in (-2, 7), got: " + request.getRoundDecimal());
+        }
+        String dbName = request.getDatabaseName();
+        String collectionName = request.getCollectionName();
+        HybridSearchRequest.Builder builder = HybridSearchRequest.newBuilder()
+                .setCollectionName(collectionName);
+
+        if (request.getPartitionNames() != null && !request.getPartitionNames().isEmpty()) {
+            request.getPartitionNames().forEach(builder::addPartitionNames);
+        }
+        if (StringUtils.isNotEmpty(dbName)) {
+            builder.setDbName(dbName);
+        }
+
+        if (StringUtils.isNotEmpty(request.getRlsPrincipal())) {
+            builder.setRlsPrincipal(request.getRlsPrincipal());
+        }
+        if (request.getSkipRls() != null) {
+            builder.setSkipRls(request.getSkipRls());
+        }
+
+        if (request.getSearchRequests() == null || request.getSearchRequests().isEmpty()) {
+            throw new MilvusClientException(ErrorCode.INVALID_PARAMS, "Sub-request list is empty.");
+        }
+
+        for (AnnSearchReq req : request.getSearchRequests()) {
+            SearchRequest searchRequest = convertAnnSearchParam(req, request.getConsistencyLevel());
+            builder.addRequests(searchRequest);
+        }
+
+        Map<String, String> props = new HashMap<>();
+        props.put(Constant.LIMIT, String.valueOf(request.getLimit()));
+        props.put(Constant.ROUND_DECIMAL, String.valueOf(request.getRoundDecimal()));
+        props.put(Constant.OFFSET, String.valueOf(request.getOffset()));
+        // set ranker
+        CreateCollectionReq.Function ranker = request.getRanker();
+        io.milvus.v2.service.vector.request.FunctionScore functionScore = request.getFunctionScore();
+        if (ranker != null && functionScore != null) {
+            throw new MilvusClientException(ErrorCode.INVALID_PARAMS, "Not allow to set both ranker and functionScore.");
+        }
+        if (functionScore != null) {
+            builder.setFunctionScore(convertFunctionScore(functionScore));
+        } else if (ranker != null) {
+            if (ranker instanceof RRFRanker || ranker instanceof WeightedRanker) {
+                // old logic for RRF/Weighted ranker
+                Map<String, String> params = ranker.getParams();
+                props.putAll(params);
+            } else {
+                // new logic for Decay/Model ranker
+                builder.setFunctionScore(convertOneFunction(ranker));
+            }
+        }
+
+        List<KeyValuePair> propertiesList = ParamUtils.AssembleKvPair(props);
+        if (CollectionUtils.isNotEmpty(propertiesList)) {
+            propertiesList.forEach(builder::addRankParams);
+        }
+
+        if (request.getGroupByFieldName() != null && !request.getGroupByFieldName().isEmpty()) {
+            builder.addRankParams(
+                    KeyValuePair.newBuilder()
+                            .setKey(Constant.GROUP_BY_FIELD)
+                            .setValue(request.getGroupByFieldName())
+                            .build());
+            if (request.getGroupSize() != null) {
+                builder.addRankParams(
+                        KeyValuePair.newBuilder()
+                                .setKey(Constant.GROUP_SIZE)
+                                .setValue(request.getGroupSize().toString())
+                                .build());
+            }
+
+            if (request.getStrictGroupSize() != null) {
+                builder.addRankParams(
+                        KeyValuePair.newBuilder()
+                                .setKey(Constant.STRICT_GROUP_SIZE)
+                                .setValue(request.getStrictGroupSize().toString())
+                                .build());
+            }
+        }
+
+        // output fields
+        if (request.getOutFields() != null && !request.getOutFields().isEmpty()) {
+            request.getOutFields().forEach(builder::addOutputFields);
+        }
+
+        long guaranteeTimestamp = getGuaranteeTimestamp(request.getConsistencyLevel(), dbName, collectionName);
+        builder.setGuaranteeTimestamp(guaranteeTimestamp);
+
+        if (request.getConsistencyLevel() == null) {
+            builder.setUseDefaultConsistency(true);
+        } else {
+            builder.setConsistencyLevelValue(request.getConsistencyLevel().getCode());
+        }
+
+        return builder.build();
+    }
+
+    private FunctionSchema convertFunctionSchema(CreateCollectionReq.Function function) {
+        Map<String, String> functionParams = function.getParams();
+        Map<String, String> params = functionParams == null ? new HashMap<>() : new HashMap<>(functionParams);
+        // FunctionSchema type keyword is "reranker", old RRF/Weighted ranker type keyword is "strategy"
+        // FunctionSchema parameters are flat, old RRF/Weighted parameters are wrapped by "params"
+        if (function instanceof RRFRanker || function instanceof WeightedRanker) {
+            String name = (function instanceof RRFRanker) ? "rrf" : "weighted";
+            params.put("reranker", name);
+            JsonObject inner = JsonParser.parseString(params.get("params")).getAsJsonObject();
+            for (String key : inner.keySet()) {
+                params.put(key, inner.get(key).toString());
+            }
+            params.remove("strategy");
+            params.remove("params");
+        }
+        return FunctionSchema.newBuilder()
+                .setName(function.getName())
+                .setDescription(function.getDescription())
+                .setType(FunctionType.forNumber(function.getFunctionType().getCode()))
+                .addAllInputFieldNames(function.getInputFieldNames())
+                .addAllParams(ParamUtils.AssembleKvPair(params))
+                .build();
+    }
+
+    private io.milvus.grpc.FunctionScore convertOneFunction(CreateCollectionReq.Function function) {
+        FunctionSchema schema = convertFunctionSchema(function);
+        return io.milvus.grpc.FunctionScore.newBuilder().addFunctions(schema).build();
+    }
+
+    private io.milvus.grpc.FunctionScore convertFunctionScore(FunctionScore functionScore) {
+        io.milvus.grpc.FunctionScore.Builder builder = io.milvus.grpc.FunctionScore.newBuilder();
+        for (CreateCollectionReq.Function function : functionScore.getFunctions()) {
+            FunctionSchema schema = convertFunctionSchema(function);
+            builder.addFunctions(schema);
+        }
+        builder.addAllParams(ParamUtils.AssembleKvPair(functionScore.getParams()));
+        return builder.build();
+    }
+
+    /**
+     * Builds a filter expression of the form {@code primaryFieldName in [...]} from the given
+     * primary key values. String IDs are quoted, other ID types are rendered as-is.
+     *
+     * @param primaryFieldName the primary key field name
+     * @param ids              the list of primary key values
+     * @return the built filter expression
+     */
+
+
+    public String getExprById(String primaryFieldName, List<?> ids) {
+        StringBuilder sb = new StringBuilder();
+        sb.append(primaryFieldName).append(" in [");
+        for (Object id : ids) {
+            if (id instanceof String) {
+                sb.append("\"").append(id.toString()).append("\",");
+            } else {
+                sb.append(id.toString()).append(",");
+            }
+        }
+        sb.deleteCharAt(sb.length() - 1);
+        sb.append("]");
+        return sb.toString();
+    }
+}

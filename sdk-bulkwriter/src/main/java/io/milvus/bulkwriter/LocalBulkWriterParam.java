@@ -1,0 +1,231 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+package io.milvus.bulkwriter;
+
+import io.milvus.bulkwriter.common.clientenum.BulkFileType;
+import io.milvus.bulkwriter.common.utils.V2AdapterUtils;
+import io.milvus.exception.ParamException;
+import io.milvus.param.ParamUtils;
+import io.milvus.param.collection.CollectionSchemaParam;
+import io.milvus.v2.service.collection.request.CreateCollectionReq;
+
+import java.util.HashMap;
+import java.util.Map;
+
+/**
+ * Parameters for <code>bulkWriter</code> interface.
+ */
+
+
+public class LocalBulkWriterParam {
+    private final CreateCollectionReq.CollectionSchema collectionSchema;
+    private final String localPath;
+    private final long chunkSize;
+    private final BulkFileType fileType;
+    private final Map<String, Object> config;
+
+    private LocalBulkWriterParam(Builder builder) {
+        this.collectionSchema = builder.collectionSchema;
+        this.localPath = builder.localPath;
+        this.chunkSize = builder.chunkSize;
+        this.fileType = builder.fileType;
+        this.config = builder.config;
+    }
+    /**
+     * Returns the collectionSchema.
+     *
+     * @return the collectionSchema
+     */
+
+
+    public CreateCollectionReq.CollectionSchema getCollectionSchema() {
+        return collectionSchema;
+    }
+    /**
+     * Returns the localPath.
+     *
+     * @return the localPath
+     */
+
+
+    public String getLocalPath() {
+        return localPath;
+    }
+    /**
+     * Returns the chunkSize.
+     *
+     * @return the chunkSize
+     */
+
+
+    public long getChunkSize() {
+        return chunkSize;
+    }
+    /**
+     * Returns the fileType.
+     *
+     * @return the fileType
+     */
+
+
+    public BulkFileType getFileType() {
+        return fileType;
+    }
+    /**
+     * Returns the config.
+     *
+     * @return the config
+     */
+
+
+    public Map<String, Object> getConfig() {
+        return config;
+    }
+
+    @Override
+    public String toString() {
+        return "LocalBulkWriterParam{" +
+                "collectionSchema=" + collectionSchema +
+                ", localPath='" + localPath + '\'' +
+                ", chunkSize=" + chunkSize +
+                ", fileType=" + fileType +
+                '}';
+    }
+    /**
+     * Creates a new builder.
+     *
+     * @return the builder
+     */
+
+
+    public static Builder newBuilder() {
+        return new Builder();
+    }
+
+    /**
+     * Builder for {@link LocalBulkWriterParam} class.
+     */
+
+
+    public static final class Builder {
+        private CreateCollectionReq.CollectionSchema collectionSchema;
+        private String localPath;
+        private long chunkSize = 128 * 1024 * 1024;
+        private BulkFileType fileType = BulkFileType.PARQUET;
+        private final Map<String, Object> config = new HashMap<>();
+
+        private Builder() {
+        }
+
+        /**
+         * Sets the collection schema.
+         *
+         * @param collectionSchema collection schema
+         * @return <code>Builder</code>
+         */
+
+
+        public Builder withCollectionSchema(CollectionSchemaParam collectionSchema) {
+            this.collectionSchema = V2AdapterUtils.convertV1Schema(collectionSchema);
+            return this;
+        }
+
+        /**
+         * Sets the collection schema by V2.
+         *
+         * @param collectionSchema collection schema
+         * @return <code>Builder</code>
+         */
+
+
+        public Builder withCollectionSchema(CreateCollectionReq.CollectionSchema collectionSchema) {
+            this.collectionSchema = collectionSchema;
+            return this;
+        }
+
+        /**
+         * Sets the localPath.
+         *
+         * @param localPath collection name
+         * @return <code>Builder</code>
+         */
+
+
+        public Builder withLocalPath(String localPath) {
+            this.localPath = localPath;
+            return this;
+        }
+        /**
+         * Sets the chunkSize.
+         *
+         * @param chunkSize the chunkSize
+         * @return this builder
+         */
+
+
+        public Builder withChunkSize(long chunkSize) {
+            this.chunkSize = chunkSize;
+            return this;
+        }
+        /**
+         * Sets the fileType.
+         *
+         * @param fileType the fileType
+         * @return this builder
+         */
+
+
+        public Builder withFileType(BulkFileType fileType) {
+            this.fileType = fileType;
+            return this;
+        }
+        /**
+         * Adds a configuration entry to the writer configuration map.
+         *
+         * @param key the configuration key
+         * @param val the configuration value
+         * @return this builder
+         */
+
+
+        public Builder withConfig(String key, Object val) {
+            this.config.put(key, val);
+            return this;
+        }
+
+        /**
+         * Verifies parameters and creates a new {@link LocalBulkWriterParam} instance.
+         *
+         * @return {@link LocalBulkWriterParam}
+         * @throws ParamException if the required parameters are invalid
+         */
+
+
+        public LocalBulkWriterParam build() throws ParamException {
+            ParamUtils.CheckNullEmptyString(localPath, "localPath");
+
+            if (collectionSchema == null) {
+                throw new ParamException("collectionParam cannot be null");
+            }
+
+            return new LocalBulkWriterParam(this);
+        }
+    }
+}

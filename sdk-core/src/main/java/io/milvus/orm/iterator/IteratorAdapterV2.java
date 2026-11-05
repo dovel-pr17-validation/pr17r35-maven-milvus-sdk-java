@@ -1,0 +1,296 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+package io.milvus.orm.iterator;
+
+import io.milvus.common.clientenum.ConsistencyLevelEnum;
+import io.milvus.exception.ParamException;
+import io.milvus.grpc.DataType;
+import io.milvus.grpc.PlaceholderType;
+import io.milvus.param.MetricType;
+import io.milvus.param.collection.FieldType;
+import io.milvus.param.dml.QueryIteratorParam;
+import io.milvus.param.dml.SearchIteratorParam;
+import io.milvus.v2.common.ConsistencyLevel;
+import io.milvus.v2.common.IndexParam;
+import io.milvus.v2.service.collection.request.CreateCollectionReq;
+import io.milvus.v2.service.vector.request.QueryIteratorReq;
+import io.milvus.v2.service.vector.request.SearchIteratorReq;
+import io.milvus.v2.service.vector.request.data.*;
+import org.apache.commons.lang3.StringUtils;
+
+import java.nio.ByteBuffer;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.SortedMap;
+
+/**
+ * Adapter that converts between the v2 iterator request classes ({@code QueryIteratorReq},
+ * {@code SearchIteratorReq}) and the legacy v1 iterator parameters used internally by the iterator
+ * implementations.
+ */
+
+
+public class IteratorAdapterV2 {
+    /**
+     * Converts a v2 query iterator request into a v1 query iterator parameter.
+     *
+     * @param queryIteratorReq the v2 query iterator request
+     * @return the equivalent v1 query iterator parameter
+     */
+
+    public static QueryIteratorParam convertV2Req(QueryIteratorReq queryIteratorReq) {
+        QueryIteratorParam.Builder builder = QueryIteratorParam.newBuilder()
+                .withDatabaseName(queryIteratorReq.getDatabaseName())
+                .withCollectionName(queryIteratorReq.getCollectionName())
+                .withPartitionNames(queryIteratorReq.getPartitionNames())
+                .withExpr(queryIteratorReq.getExpr())
+                .withOutFields(queryIteratorReq.getOutputFields())
+                .withOffset(queryIteratorReq.getOffset())
+                .withLimit(queryIteratorReq.getLimit())
+                .withIgnoreGrowing(queryIteratorReq.isIgnoreGrowing())
+                .withBatchSize(queryIteratorReq.getBatchSize())
+                .withReduceStopForBest(queryIteratorReq.isReduceStopForBest());
+
+        if (queryIteratorReq.getConsistencyLevel() != null) {
+            builder.withConsistencyLevel(ConsistencyLevelEnum.valueOf(queryIteratorReq.getConsistencyLevel().name()));
+        }
+
+        return builder.build();
+    }
+
+    /**
+     * Converts a v1 query iterator parameter back into a v2 query iterator request.
+     *
+     * @param param the v1 query iterator parameter
+     * @return the equivalent v2 query iterator request
+     */
+
+
+    public static QueryIteratorReq convertV1Param(QueryIteratorParam param) {
+        ConsistencyLevel level = null;
+        if (param.getConsistencyLevel() != null) {
+            level = ConsistencyLevel.valueOf(param.getConsistencyLevel().name());
+        }
+
+        return QueryIteratorReq.builder()
+                .databaseName(param.getDatabaseName())
+                .collectionName(param.getCollectionName())
+                .partitionNames(param.getPartitionNames())
+                .expr(param.getExpr())
+                .outputFields(param.getOutFields())
+                .offset(param.getOffset())
+                .limit(param.getLimit())
+                .ignoreGrowing(param.isIgnoreGrowing())
+                .batchSize(param.getBatchSize())
+                .reduceStopForBest(param.isReduceStopForBest())
+                .consistencyLevel(level)
+                .build();
+    }
+
+    /**
+     * Converts a v2 search iterator request into a v1 search iterator parameter.
+     *
+     * <p>All target vectors of the request must be of the same placeholder (vector) type.
+     *
+     * @param searchIteratorReq the v2 search iterator request
+     * @return the equivalent v1 search iterator parameter
+     * @throws io.milvus.exception.ParamException if the target vectors are of different types or of
+     *         an unsupported type
+     */
+
+
+    public static SearchIteratorParam convertV2Req(SearchIteratorReq searchIteratorReq) {
+        MetricType metricType = MetricType.None;
+        if (searchIteratorReq.getMetricType() != IndexParam.MetricType.INVALID) {
+            metricType = MetricType.valueOf(searchIteratorReq.getMetricType().name());
+        }
+
+        SearchIteratorParam.Builder builder = SearchIteratorParam.newBuilder()
+                .withDatabaseName(searchIteratorReq.getDatabaseName())
+                .withCollectionName(searchIteratorReq.getCollectionName())
+                .withPartitionNames(searchIteratorReq.getPartitionNames())
+                .withVectorFieldName(searchIteratorReq.getVectorFieldName())
+                .withMetricType(metricType)
+                .withLimit(searchIteratorReq.getLimit())
+                .withExpr(searchIteratorReq.getExpr())
+                .withOutFields(searchIteratorReq.getOutputFields())
+                .withRoundDecimal(searchIteratorReq.getRoundDecimal())
+                .withParams(searchIteratorReq.getParams())
+                .withGroupByFieldName(searchIteratorReq.getGroupByFieldName())
+                .withIgnoreGrowing(searchIteratorReq.isIgnoreGrowing())
+                .withBatchSize(searchIteratorReq.getBatchSize())
+                .withRlsPrincipal(searchIteratorReq.getRlsPrincipal())
+                .withSkipRls(searchIteratorReq.getSkipRls());
+
+        if (searchIteratorReq.getConsistencyLevel() != null) {
+            builder.withConsistencyLevel(ConsistencyLevelEnum.valueOf(searchIteratorReq.getConsistencyLevel().name()));
+        }
+
+        List<BaseVector> vectors = searchIteratorReq.getVectors();
+        PlaceholderType plType = vectors.get(0).getPlaceholderType();
+        for (BaseVector vector : vectors) {
+            if (vector.getPlaceholderType() != plType) {
+                throw new ParamException("Different types of target vectors in a search request is not allowed.");
+            }
+        }
+
+        switch (plType) {
+            case FloatVector: {
+                List<List<Float>> data = new ArrayList<>();
+                vectors.forEach(vector -> data.add((List<Float>) vector.getData()));
+                builder.withFloatVectors(data);
+                break;
+            }
+            case BinaryVector: {
+                List<ByteBuffer> data = new ArrayList<>();
+                vectors.forEach(vector -> data.add((ByteBuffer) vector.getData()));
+                builder.withBinaryVectors(data);
+                break;
+            }
+            case Float16Vector: {
+                List<ByteBuffer> data = new ArrayList<>();
+                vectors.forEach(vector -> data.add((ByteBuffer) vector.getData()));
+                builder.withFloat16Vectors(data);
+                break;
+            }
+            case BFloat16Vector: {
+                List<ByteBuffer> data = new ArrayList<>();
+                vectors.forEach(vector -> data.add((ByteBuffer) vector.getData()));
+                builder.withBFloat16Vectors(data);
+                break;
+            }
+            case SparseFloatVector: {
+                List<SortedMap<Long, Float>> data = new ArrayList<>();
+                vectors.forEach(vector -> data.add((SortedMap<Long, Float>) vector.getData()));
+                builder.withSparseFloatVectors(data);
+                break;
+            }
+            default:
+                throw new ParamException("Unsupported vector type.");
+        }
+
+        return builder.build();
+    }
+
+    /**
+     * Converts a v1 search iterator parameter back into a v2 search iterator request.
+     *
+     * <p>The target vectors are wrapped into the corresponding v2 vector data classes according to
+     * the placeholder type of the parameter.
+     *
+     * @param param the v1 search iterator parameter
+     * @return the equivalent v2 search iterator request
+     * @throws io.milvus.exception.ParamException if the placeholder type of the parameter is
+     *         unsupported
+     */
+
+
+    public static SearchIteratorReq convertV1Param(SearchIteratorParam param) {
+        ConsistencyLevel level = null;
+        if (param.getConsistencyLevel() != null) {
+            level = ConsistencyLevel.valueOf(param.getConsistencyLevel().name());
+        }
+
+        IndexParam.MetricType metricType = IndexParam.MetricType.INVALID;
+        if (StringUtils.isEmpty(param.getMetricType())) {
+            metricType = IndexParam.MetricType.valueOf(param.getMetricType());
+        }
+
+        List<BaseVector> vectors = new ArrayList<>();
+        switch (param.getPlType()) {
+            case FloatVector: {
+                List<List<Float>> data = (List<List<Float>>) param.getVectors();
+                data.forEach(vector -> vectors.add(new FloatVec(vector)));
+                break;
+            }
+            case BinaryVector: {
+                List<ByteBuffer> data = (List<ByteBuffer>) param.getVectors();
+                data.forEach(vector -> vectors.add(new BinaryVec(vector)));
+                break;
+            }
+            case Float16Vector: {
+                List<ByteBuffer> data = (List<ByteBuffer>) param.getVectors();
+                data.forEach(vector -> vectors.add(new Float16Vec(vector)));
+                break;
+            }
+            case BFloat16Vector: {
+                List<ByteBuffer> data = (List<ByteBuffer>) param.getVectors();
+                data.forEach(vector -> vectors.add(new BFloat16Vec(vector)));
+                break;
+            }
+            case SparseFloatVector: {
+                List<SortedMap<Long, Float>> data = (List<SortedMap<Long, Float>>) param.getVectors();
+                data.forEach(vector -> vectors.add(new SparseFloatVec(vector)));
+                break;
+            }
+            default:
+                throw new ParamException("Unsupported vector type.");
+        }
+
+        return SearchIteratorReq.builder()
+                .databaseName(param.getDatabaseName())
+                .collectionName(param.getCollectionName())
+                .partitionNames(param.getPartitionNames())
+                .vectorFieldName(param.getVectorFieldName())
+                .vectors(vectors)
+                .consistencyLevel(level)
+                .metricType(metricType)
+                .limit(param.getTopK())
+                .expr(param.getExpr())
+                .outputFields(param.getOutFields())
+                .roundDecimal(param.getRoundDecimal())
+                .params(param.getParams())
+                .groupByFieldName(param.getGroupByFieldName())
+                .ignoreGrowing(param.isIgnoreGrowing())
+                .batchSize(param.getBatchSize())
+                .build();
+    }
+
+    /**
+     * Converts a v2 field schema into a v1 field type.
+     *
+     * @param schema the v2 field schema, typically the primary key field of the collection
+     * @return the equivalent v1 field type
+     */
+
+
+    public static FieldType convertV2Field(CreateCollectionReq.FieldSchema schema) {
+        FieldType.Builder builder = FieldType.newBuilder()
+                .withName(schema.getName())
+                .withDataType(DataType.valueOf(schema.getDataType().name()))
+                .withPrimaryKey(schema.getIsPrimaryKey())
+                .withAutoID(schema.getAutoID())
+                .withPartitionKey(schema.getIsPartitionKey());
+
+        if (schema.getDimension() != null) {
+            builder.withDimension(schema.getDimension());
+        }
+        if (schema.getMaxLength() != null) {
+            builder.withMaxLength(schema.getMaxLength());
+        }
+        if (schema.getMaxCapacity() != null) {
+            builder.withMaxCapacity(schema.getMaxCapacity());
+        }
+        if (schema.getElementType() != null) {
+            builder.withElementType(DataType.valueOf(schema.getElementType().name()));
+        }
+        return builder.build();
+    }
+}

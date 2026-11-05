@@ -1,0 +1,330 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+package io.milvus.bulkwriter.connect;
+
+import io.milvus.common.utils.RedactCredential;
+import io.milvus.exception.ParamException;
+import io.milvus.param.ParamUtils;
+import io.minio.credentials.Provider;
+import okhttp3.OkHttpClient;
+import org.apache.commons.lang3.StringUtils;
+import org.jetbrains.annotations.NotNull;
+
+/**
+ * Parameters for <code>RemoteBulkWriter</code> interface.
+ */
+
+
+public class S3ConnectParam extends StorageConnectParam {
+    private final String bucketName;
+    private final String endpoint;
+    private final String accessKey;
+    private final String secretKey;
+    private final String sessionToken;
+    private final String region;
+    private final OkHttpClient httpClient;
+    private final String cloudName;
+    private final Provider credentialsProvider;
+
+    private S3ConnectParam(@NotNull Builder builder) {
+        this.bucketName = builder.bucketName;
+        this.endpoint = builder.endpoint;
+        this.accessKey = builder.accessKey;
+        this.secretKey = builder.secretKey;
+        this.sessionToken = builder.sessionToken;
+        this.region = builder.region;
+        this.httpClient = builder.httpClient;
+        this.cloudName = builder.cloudName;
+        this.credentialsProvider = builder.credentialsProvider;
+    }
+    /**
+     * Returns the bucketName.
+     *
+     * @return the bucketName
+     */
+
+
+    public String getBucketName() {
+        return bucketName;
+    }
+    /**
+     * Returns the endpoint.
+     *
+     * @return the endpoint
+     */
+
+
+    public String getEndpoint() {
+        return endpoint;
+    }
+    /**
+     * Returns the accessKey.
+     *
+     * @return the accessKey
+     */
+
+
+    public String getAccessKey() {
+        return accessKey;
+    }
+    /**
+     * Returns the secretKey.
+     *
+     * @return the secretKey
+     */
+
+
+    public String getSecretKey() {
+        return secretKey;
+    }
+    /**
+     * Returns the sessionToken.
+     *
+     * @return the sessionToken
+     */
+
+
+    public String getSessionToken() {
+        return sessionToken;
+    }
+    /**
+     * Returns the region.
+     *
+     * @return the region
+     */
+
+
+    public String getRegion() {
+        return region;
+    }
+    /**
+     * Returns the httpClient.
+     *
+     * @return the httpClient
+     */
+
+
+    public OkHttpClient getHttpClient() {
+        return httpClient;
+    }
+    /**
+     * Returns the cloudName.
+     *
+     * @return the cloudName
+     */
+
+
+    public String getCloudName() {
+        return cloudName;
+    }
+
+    /**
+     * An external credentials provider that refreshes credentials automatically while
+     * the writer is running. When set, it takes precedence over the static
+     * accessKey/secretKey/sessionToken fields. For GCP the bearer token is carried in
+     * {@code Credentials.sessionToken()} (see GcpMetadataServerCredentialsProvider).
+     */
+
+
+    public Provider getCredentialsProvider() {
+        return credentialsProvider;
+    }
+
+    @Override
+    public String toString() {
+        return "S3ConnectParam{" +
+                "bucketName='" + bucketName + '\'' +
+                ", endpoint='" + endpoint + '\'' +
+                ", accessKey='" + RedactCredential.redactCredential(accessKey) + '\'' +
+                ", secretKey='" + RedactCredential.redactCredential(secretKey) + '\'' +
+                ", sessionToken='" + RedactCredential.redactCredential(sessionToken) + '\'' +
+                ", region='" + region + '\'' +
+                ", cloudName='" + cloudName + '\'' +
+                '}';
+    }
+    /**
+     * Creates a new builder.
+     *
+     * @return the builder
+     */
+
+
+    public static Builder newBuilder() {
+        return new Builder();
+    }
+
+    /**
+     * Builder for {@link S3ConnectParam} class.
+     */
+
+
+    public static final class Builder {
+        private String bucketName;
+        private String endpoint;
+        private String accessKey;
+        private String secretKey;
+        private String sessionToken;
+        private String region;
+        private OkHttpClient httpClient;
+        private String cloudName;
+        private Provider credentialsProvider;
+
+        private Builder() {
+        }
+
+        /**
+         * Sets the cloudName.
+         *
+         * @param cloudName cloud name
+         * @return <code>Builder</code>
+         */
+
+
+        public Builder withCloudName(@NotNull String cloudName) {
+            this.cloudName = cloudName;
+            return this;
+        }
+
+        /**
+         * Sets the bucketName info.
+         *
+         * @param bucketName bucket info
+         * @return <code>Builder</code>
+         */
+
+
+        public Builder withBucketName(@NotNull String bucketName) {
+            this.bucketName = bucketName;
+            return this;
+        }
+
+        /**
+         * Sets the endpoint.
+         *
+         * @param endpoint endpoint info
+         * @return <code>Builder</code>
+         */
+
+
+        public Builder withEndpoint(@NotNull String endpoint) {
+            this.endpoint = endpoint;
+            return this;
+        }
+        /**
+         * Sets the accessKey.
+         *
+         * @param accessKey the accessKey
+         * @return this builder
+         */
+
+
+        public Builder withAccessKey(@NotNull String accessKey) {
+            this.accessKey = accessKey;
+            return this;
+        }
+        /**
+         * Sets the secretKey.
+         *
+         * @param secretKey the secretKey
+         * @return this builder
+         */
+
+
+        public Builder withSecretKey(@NotNull String secretKey) {
+            this.secretKey = secretKey;
+            return this;
+        }
+        /**
+         * Sets the sessionToken.
+         *
+         * @param sessionToken the sessionToken
+         * @return this builder
+         */
+
+
+        public Builder withSessionToken(@NotNull String sessionToken) {
+            this.sessionToken = sessionToken;
+            return this;
+        }
+        /**
+         * Sets the region.
+         *
+         * @param region the region
+         * @return this builder
+         */
+
+
+        public Builder withRegion(@NotNull String region) {
+            this.region = region;
+            return this;
+        }
+        /**
+         * Sets the httpClient.
+         *
+         * @param httpClient the httpClient
+         * @return this builder
+         */
+
+
+        public Builder withHttpClient(@NotNull OkHttpClient httpClient) {
+            this.httpClient = httpClient;
+            return this;
+        }
+
+        /**
+         * Sets an external credentials provider. Use this for identity-based
+         * authentication that must refresh credentials while the writer is running
+         * (e.g. AWS web identity / IRSA, GCP workload identity). Mutually exclusive
+         * with the static accessKey/secretKey/sessionToken setters; enforced at
+         * {@link #build()}. For GCP the provider's {@code fetch()} may be invoked per
+         * HTTP request, so it must cache credentials internally (per the minio
+         * {@code Provider} contract).
+         *
+         * @param credentialsProvider the external credentials provider
+         * @return this builder
+         */
+
+
+        public Builder withCredentialsProvider(@NotNull Provider credentialsProvider) {
+            this.credentialsProvider = credentialsProvider;
+            return this;
+        }
+
+        /**
+         * Verifies parameters and creates a new {@link S3ConnectParam} instance.
+         *
+         * @return {@link S3ConnectParam}
+         * @throws ParamException if the required parameters are invalid
+         */
+
+
+        public S3ConnectParam build() throws ParamException {
+            ParamUtils.CheckNullEmptyString(endpoint, "endpoint");
+            ParamUtils.CheckNullEmptyString(bucketName, "bucketName");
+            if (credentialsProvider != null && (StringUtils.isNotBlank(accessKey)
+                    || StringUtils.isNotBlank(secretKey) || StringUtils.isNotBlank(sessionToken))) {
+                throw new ParamException("credentialsProvider is mutually exclusive with the static"
+                        + " accessKey/secretKey/sessionToken fields");
+            }
+
+            return new S3ConnectParam(this);
+        }
+    }
+}

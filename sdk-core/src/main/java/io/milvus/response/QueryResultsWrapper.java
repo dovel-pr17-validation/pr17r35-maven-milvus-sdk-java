@@ -1,0 +1,237 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+package io.milvus.response;
+
+import com.google.gson.JsonObject;
+import io.milvus.exception.ParamException;
+import io.milvus.grpc.FieldData;
+import io.milvus.grpc.QueryResults;
+import io.milvus.param.Constant;
+import io.milvus.response.basic.RowRecordWrapper;
+
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+/**
+ * Utility class to wrap response of <code>query</code> interface.
+ */
+
+
+public class QueryResultsWrapper extends RowRecordWrapper {
+    private final QueryResults results;
+
+    /**
+     * Wraps the given query results.
+     *
+     * @param results the gRPC {@code QueryResults}, must not be {@code null}
+     */
+
+
+    public QueryResultsWrapper(QueryResults results) {
+        if (results == null) {
+            throw new IllegalArgumentException("QueryResults cannot be null");
+        }
+        this.results = results;
+    }
+
+    /**
+     * Gets {@link FieldDataWrapper} for a field.
+     * Throws {@link ParamException} if the field doesn't exist.
+     *
+     * @param fieldName field name to get output data
+     * @return {@link FieldDataWrapper}
+     */
+
+
+    public FieldDataWrapper getFieldWrapper(String fieldName) throws ParamException {
+        if (fieldName == null) {
+            throw new IllegalArgumentException("Field name cannot be null");
+        }
+        List<FieldData> fields = results.getFieldsDataList();
+        for (FieldData field : fields) {
+            if (fieldName.compareTo(field.getFieldName()) == 0) {
+                return getFieldWrapperInternal(field);
+            }
+        }
+
+        throw new ParamException("The field name doesn't exist");
+    }
+
+    /**
+     * Gets row records list from query result.
+     *
+     * @return List of <code>QueryResultsWrapper.RowRecord</code> a row records list of the query result
+     */
+    @Override
+    public List<QueryResultsWrapper.RowRecord> getRowRecords() {
+        long rowCount = getRowCount();
+        List<QueryResultsWrapper.RowRecord> records = new ArrayList<>();
+        for (long i = 0; i < rowCount; i++) {
+            QueryResultsWrapper.RowRecord record = buildRowRecord(i);
+            records.add(record);
+        }
+
+        return records;
+    }
+
+    /**
+     * Gets a row record from result.
+     * Throws {@link ParamException} if the index is illegal.
+     *
+     * @param index index of a row
+     * @return <code>RowRecord</code> a row record of the result
+     */
+    protected QueryResultsWrapper.RowRecord buildRowRecord(long index) {
+        QueryResultsWrapper.RowRecord record = new QueryResultsWrapper.RowRecord();
+        buildRowRecord(record, index);
+        return record;
+    }
+
+    /**
+     * Gets the row count of the result.
+     *
+     * @return <code>long</code> row count of the result
+     */
+
+
+    public long getRowCount() {
+        List<FieldData> fields = results.getFieldsDataList();
+        for (FieldData field : fields) {
+            FieldDataWrapper wrapper = getFieldWrapperInternal(field);
+            return wrapper.getRowCount();
+        }
+
+        return 0L;
+    }
+
+    @Override
+    protected List<FieldData> getFieldDataList() {
+        return results.getFieldsDataList();
+    }
+
+    protected List<String> getOutputFields() {
+        return results.getOutputFieldsList();
+    }
+
+    /**
+     * Internal-use class to wrap response of <code>query</code> interface.
+     */
+
+
+    public static final class RowRecord {
+        Map<String, Object> fieldValues = new HashMap<>();
+
+        /**
+         * Creates an empty row record.
+         */
+
+
+        public RowRecord() {
+        }
+
+        /**
+         * Returns all field values of this record as a map.
+         *
+         * @return the field values keyed by field name
+         */
+
+
+        public Map<String, Object> getFieldValues() {
+            return fieldValues;
+        }
+
+        /**
+         * Puts a field value into this record if the key is not already present.
+         *
+         * @param keyName the field name
+         * @param obj     the field value
+         * @return {@code true} if the value was inserted, {@code false} if the key already exists
+         */
+
+
+        public boolean put(String keyName, Object obj) {
+            if (fieldValues.containsKey(keyName)) {
+                return false;
+            }
+            fieldValues.put(keyName, obj);
+
+            return true;
+        }
+
+        /**
+         * Get a value by a key name. If the key name is a field name, return the value of this field.
+         * If the key name is in dynamic field, return the value from the dynamic field.
+         * Throws {@link ParamException} if the key name doesn't exist.
+         *
+         * @param keyName a field name or dynamic field name
+         * @return {@link Object}
+         */
+
+
+        public Object get(String keyName) throws ParamException {
+            if (fieldValues.isEmpty()) {
+                throw new ParamException("This record is empty");
+            }
+
+            Object obj = fieldValues.get(keyName);
+            if (obj == null) {
+                // find the value from dynamic field
+                Object meta = fieldValues.get(Constant.DYNAMIC_FIELD_NAME);
+                if (meta != null) {
+                    JsonObject jsonMata = (JsonObject) meta;
+                    Object innerObj = jsonMata.get(keyName);
+                    if (innerObj != null) {
+                        return innerObj;
+                    }
+                }
+            }
+
+            return obj;
+        }
+
+        /**
+         * Test if a key exists
+         *
+         * @param keyName a field name or dynamic field name
+         * @return boolean
+         */
+
+
+        public boolean contains(String keyName) {
+            return fieldValues.containsKey(keyName);
+        }
+
+        /**
+         * Constructs a <code>String</code> by {@link QueryResultsWrapper.RowRecord} instance.
+         *
+         * @return <code>String</code>
+         */
+        @Override
+        public String toString() {
+            List<String> pairs = new ArrayList<>();
+            fieldValues.forEach((keyName, fieldValue) -> {
+                pairs.add(keyName + ":" + fieldValue);
+            });
+            return pairs.toString();
+        }
+    }
+}

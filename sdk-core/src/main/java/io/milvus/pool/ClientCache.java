@@ -1,0 +1,470 @@
+package io.milvus.pool;
+
+import io.milvus.v2.exception.ErrorCode;
+import io.milvus.v2.exception.MilvusClientException;
+import org.apache.commons.pool2.impl.GenericKeyedObjectPool;
+import org.jetbrains.annotations.NotNull;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.Objects;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
+
+/**
+ * Per-key client cache that dynamically scales the number of active Milvus clients based on the
+ * observed call rate (QPS).
+ *
+ * <p>The cache keeps a set of borrowed clients from the underlying {@link GenericKeyedObjectPool}.
+ * {@link #getClient()} returns the least-loaded client and increases its reference count, while
+ * {@link #returnClient} decreases the count. A periodic timer samples the QPS: when the per-client
+ * call rate exceeds {@link #THRESHOLD_INCREASE}, more clients are borrowed from the pool; when it
+ * drops below {@link #THRESHOLD_DECREASE}, the most loaded client is retired and returned to the
+ * pool once its reference count reaches zero. This prevents a single HTTP/2 connection from
+ * exceeding its concurrent-stream limit under high load.
+ *
+ * @param <T> the client type, such as {@code MilvusClient} or {@code MilvusClientV2}
+ */
+
+
+public class ClientCache<T> {
+    /**
+     * Per-client calls per second above which the cache borrows additional clients.
+     */
+
+    public static final int THRESHOLD_INCREASE = 100;
+    /**
+     * Per-client calls per second below which the cache retires a client.
+     */
+
+    public static final int THRESHOLD_DECREASE = 50;
+
+    private static final Logger logger = LoggerFactory.getLogger(ClientCache.class);
+    private final String key;
+    private final GenericKeyedObjectPool<String, T> clientPool;
+    private final CopyOnWriteArrayList<ClientWrapper<T>> activeClientList = new CopyOnWriteArrayList<>();
+    private final CopyOnWriteArrayList<ClientWrapper<T>> retireClientList = new CopyOnWriteArrayList<>();
+    private final ScheduledExecutorService scheduler;
+    private final AtomicLong totalCallNumber = new AtomicLong(0L);
+    private final Lock clientListLock;
+    private long lastCheckMs = 0L;
+    private float fetchClientPerSecond = 0.0F;
+
+    protected ClientCache(String key, GenericKeyedObjectPool<String, T> pool) {
+        this.key = key;
+        this.clientPool = pool;
+        this.clientListLock = new ReentrantLock(true);
+
+        ThreadFactory threadFactory = new ThreadFactory() {
+            @Override
+            public Thread newThread(@NotNull Runnable r) {
+                Thread t = new Thread(r);
+                t.setDaemon(true);
+                t.setPriority(Thread.MAX_PRIORITY); // set the highest priority for the timer
+                return t;
+            }
+        };
+        this.scheduler = Executors.newScheduledThreadPool(1, threadFactory);
+
+        startTimer(1000L);
+    }
+
+    /**
+     * Pre-creates the configured minimum number of idle clients for this key and adds them to the
+     * active client list.
+     *
+     * <p>Calling this method before the first business request reduces the latency of the first
+     * {@link #getClient()} call.
+     */
+
+
+    public void preparePool() {
+        try {
+            // preparePool() will create minIdlePerKey MilvusClient objects in advance
+            clientPool.preparePool(this.key);
+        } catch (Exception e) {
+            logger.error("Failed to prepare pool {}, exception: ", key, e);
+            throw new MilvusClientException(ErrorCode.CLIENT_ERROR, e);
+        }
+
+        // Put the pre-created clients into activeClientList
+        // avoid borrow client from pool multiple times when multiple threads call preparePool() at the same time,
+        // add a lock here since preparePool() is called only one time in practice, doesn't affect major performance
+        int minIdlePerKey = clientPool.getMinIdlePerKey();
+
+        clientListLock.lock();
+        try {
+            if (activeClientList.isEmpty()) {
+                for (int i = 0; i < minIdlePerKey; i++) {
+                    activeClientList.add(new ClientWrapper<>(clientPool.borrowObject(this.key)));
+                }
+            }
+        } catch (Exception e) {
+            logger.error("Failed to borrow client from pool {}, exception: ", key, e);
+            throw new MilvusClientException(ErrorCode.CLIENT_ERROR, e);
+        } finally {
+            clientListLock.unlock();
+        }
+
+        if (logger.isDebugEnabled()) {
+            logger.debug("ClientCache key: {} cache clients: {} ", key, activeClientList.size());
+            logger.debug("Pool initialize idle: {} active: {} ", clientPool.getNumIdle(key), clientPool.getNumActive(key));
+        }
+//        System.out.printf("Key: %s, cache client: %d%n", key, activeClientList.size());
+//        System.out.printf("Pool idle %d, active %d%n", clientPool.getNumIdle(key), clientPool.getNumActive(key));
+    }
+
+    // this method is called in an interval, it does the following tasks:
+    // - if QPS is high, borrow client from the pool and put into activeClientList
+    // - if QPS is low, pick a client from activeClientList and put into retireClientList
+    //
+    // Most of gRPC implementations uses a single long-lived HTTP/2 connection, each HTTP/2 connections have a limit
+    // on the number of concurrent streams which is default 100. When the number of active RPCs on the connection
+    // reaches this limit, additional RPCs are queued in the client and must wait for active RPCs to finish
+    // before they are sent.
+    //
+    // Treat qps >= THRESHOLD_INCREASE as high, qps <= THRESHOLD_DECREASE as low
+    private void checkQPS() {
+        if (activeClientList.isEmpty()) {
+            // reset the last check time point
+            lastCheckMs = System.currentTimeMillis();
+            return;
+        }
+
+        long totalCallNum = totalCallNumber.get();
+        float perClientCall = (float) totalCallNum / activeClientList.size();
+        long timeGapMs = System.currentTimeMillis() - lastCheckMs;
+        if (timeGapMs == 0) {
+            timeGapMs = 1;  // avoid zero
+        }
+        float perClientPerSecond = perClientCall * 1000 / timeGapMs;
+        this.fetchClientPerSecond = (float) (totalCallNum * 1000) / timeGapMs;
+        if (logger.isDebugEnabled()) {
+
+            logger.debug("ClientCache key: {} fetchClientPerSecond: {} perClientPerSecond: {}, cached clients: {}",
+                    key, fetchClientPerSecond, perClientPerSecond, activeClientList.size());
+            logger.debug("Pool idle: {} active: {} ", clientPool.getNumIdle(key), clientPool.getNumActive(key));
+        }
+//        System.out.printf("Key: %s, fetchClientPerSecond: %.2f, perClientPerSecond: %.2f, cache client: %d%n", key, fetchClientPerSecond, perClientPerSecond, activeClientList.size());
+//        System.out.printf("Pool idle %d, active %d%n", clientPool.getNumIdle(key), clientPool.getNumActive(key));
+
+        // reset the counter and the last check time point
+        totalCallNumber.set(0L);
+        lastCheckMs = System.currentTimeMillis();
+
+        if (perClientPerSecond >= THRESHOLD_INCREASE) {
+            // try to create more clients to reduce the perClientPerSecond to under THRESHOLD_INCREASE
+            // add no more than 3 clients since the qps could change during we're adding new clients
+            // the next call of checkQPS() will add more clients if the perClientPerSecond is still high
+            int expectedNum = (int) Math.ceil((double) totalCallNum / THRESHOLD_INCREASE);
+            int moreNum = expectedNum - activeClientList.size();
+            if (moreNum > 3) {
+                moreNum = 3;
+            }
+
+            for (int k = 0; k < moreNum; k++) {
+                T client = fetchFromPool();
+                // if the pool reaches MaxTotalPerKey, the new client is null
+                if (client == null) {
+                    break;
+                }
+
+                ClientWrapper<T> wrapper = new ClientWrapper<>(client);
+                activeClientList.add(wrapper);
+
+                if (logger.isDebugEnabled()) {
+                    logger.debug("ClientCache key: {} borrows a client", key);
+                }
+//                System.out.printf("Key: %s borrows a client%n", key);
+            }
+        }
+
+        if (activeClientList.size() > 1 && perClientPerSecond <= THRESHOLD_DECREASE) {
+            // if activeClientList has only one client, no need to retire it
+            // otherwise, retire the max load client
+            int maxLoad = -1000;
+            int maxIndex = -1;
+            for (int i = 0; i < activeClientList.size(); i++) {
+                ClientWrapper<T> wrapper = activeClientList.get(i);
+                int refCount = wrapper.getRefCount();
+                if (refCount > maxLoad) {
+                    maxLoad = refCount;
+                    maxIndex = i;
+                }
+            }
+            if (maxIndex >= 0) {
+                ClientWrapper<T> wrapper = activeClientList.get(maxIndex);
+                activeClientList.remove(maxIndex);
+                retireClientList.add(wrapper);
+            }
+        }
+
+        // return the retired client to pool if ref count is zero
+        returnRetiredClients();
+    }
+
+    private void returnRetiredClients() {
+        retireClientList.removeIf(wrapper -> {
+            if (wrapper.getRefCount() <= 0) {
+                returnToPool(wrapper.getRawClient());
+
+                if (logger.isDebugEnabled()) {
+                    logger.debug("ClientCache key: {} returns a client", key);
+                }
+//                System.out.printf("Key: %s returns a client%n", key);
+                return true;
+            }
+            return false;
+        });
+    }
+
+    private void startTimer(long interval) {
+        if (interval < 1000L) {
+            interval = 1000L; // min 1000
+        }
+
+        lastCheckMs = System.currentTimeMillis();
+        scheduler.scheduleAtFixedRate(new Runnable() {
+            @Override
+            public void run() {
+                checkQPS();
+            }
+        }, interval, interval, TimeUnit.MILLISECONDS);
+    }
+
+    /**
+     * Stops the periodic QPS-check timer and returns all active and retired clients to the pool.
+     */
+
+
+    public void stopTimer() {
+        // Stop scheduled tasks and wait for any in-flight checkQPS() execution to finish
+        scheduler.shutdownNow();
+        try {
+            scheduler.awaitTermination(5, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+
+        // Return all active and retired clients to the pool so they can be properly destroyed
+        for (ClientWrapper<T> wrapper : activeClientList) {
+            returnToPool(wrapper.getRawClient());
+        }
+        activeClientList.clear();
+        for (ClientWrapper<T> wrapper : retireClientList) {
+            returnToPool(wrapper.getRawClient());
+        }
+        retireClientList.clear();
+    }
+
+    /**
+     * Returns a client from the cache, increasing its reference count.
+     *
+     * <p>The client with the minimum reference count is selected to balance the load across all
+     * cached clients. If the active client list is empty, a client is fetched from the underlying
+     * pool first. A {@code null} value is returned when no client can be fetched, for example when
+     * the pool limit is reached.
+     *
+     * @return a client object, or {@code null} if no client could be fetched
+     */
+
+
+    public T getClient() {
+        if (activeClientList.isEmpty()) {
+            // multiple threads can run into this section, add a lock to ensure only one thread can fetch the first
+            // client object, this section is entered only one time, the lock doesn't affect major performance
+            clientListLock.lock();
+            try {
+                if (activeClientList.isEmpty()) {
+                    T client = fetchFromPool();
+                    if (client == null) {
+                        // no need to count the totalCallNumber is cannot fetch a client
+                        return null; // reach MaxTotalPerKey?
+                    }
+                    ClientWrapper<T> wrapper = new ClientWrapper<>(client);
+                    activeClientList.add(wrapper);
+                    totalCallNumber.incrementAndGet(); // count the totalCallNumber when successfully fetch a client
+                    return wrapper.getClient();
+                }
+            } finally {
+                clientListLock.unlock();
+            }
+        }
+
+        // round-robin is not a good choice because the activeClientList is occasionally changed.
+        // here we return the minimum load client, the for loop of CopyOnWriteArrayList is high performance
+        // typically, the activeClientList is not a large list since a dozen of clients can take thousands of qps,
+        // I suppose the loop is a cheap operation.
+        int minLoad = Integer.MAX_VALUE;
+        ClientWrapper<T> wrapper = null;
+        for (ClientWrapper<T> tempWrapper : activeClientList) {
+            if (tempWrapper.getRefCount() < minLoad) {
+                minLoad = tempWrapper.getRefCount();
+                wrapper = tempWrapper;
+            }
+        }
+        if (wrapper == null) {
+            // should not be here, the "if (activeClientList.isEmpty())" section has already ensured
+            // there must be a client in activeClientList
+            wrapper = activeClientList.get(0);
+        }
+
+        totalCallNumber.incrementAndGet(); // count the totalCallNumber when successfully fetch a client
+        return wrapper.getClient();
+    }
+
+    /**
+     * Returns a client, decreasing its reference count.
+     *
+     * <p>The client is not returned to the pool immediately; the QPS-check timer retires it when
+     * the load is low. Callers should ensure the client is returned, otherwise it stays in the
+     * active list and cannot be reused.
+     *
+     * @param grpcClient the client to return
+     */
+
+
+    public void returnClient(T grpcClient) {
+        // for-loop of CopyOnWriteArrayList is thread safe
+        // this method only decrements the call number, the checkQPS timer will retire client accordingly
+        for (ClientWrapper<T> wrapper : activeClientList) {
+            if (wrapper.equals(grpcClient)) {
+                wrapper.returnClient();
+                return;
+            }
+        }
+        for (ClientWrapper<T> wrapper : retireClientList) {
+            if (wrapper.equals(grpcClient)) {
+                wrapper.returnClient();
+                return;
+            }
+        }
+    }
+
+    private T fetchFromPool() {
+        try {
+            // borrowed clients exceeds MaxTotalPerKey?
+            if (activeClientList.size() + retireClientList.size() >= clientPool.getMaxTotalPerKey()) {
+                return null;
+            }
+            // TODO: how to check borrowed clients exceeds MaxTotal?
+            // if the number of borrowed clients is less than MaxTotalPerKey but the total borrowed clients of all keys
+            // exceeds MaxTotal, clientPool.borrowObject() will throw an exception "Timeout waiting for idle object".
+            return clientPool.borrowObject(this.key);
+        } catch (Exception e) {
+            // the pool might return timeout exception if it could not get a client in PoolConfig.maxBlockWaitDuration
+            // fetchFromPool() is internal use, return null here, let the caller handle.
+            logger.error("Failed to get client, exception: ", e);
+            return null;
+        }
+    }
+
+    private void returnToPool(T grpcClient) {
+        try {
+            clientPool.returnObject(this.key, grpcClient);
+        } catch (Exception e) {
+            // the pool might return exception if the key doesn't exist or the grpcClient doesn't belong to this pool
+            // returnToPool is internal use, the client must be in this pool, mute the exception
+            logger.error("Failed to return client, exception: ", e);
+        }
+    }
+
+    /**
+     * Returns the number of client fetches per second measured by the last QPS check.
+     *
+     * @return the fetch rate per second
+     */
+
+
+    public float fetchClientPerSecond() {
+        return this.fetchClientPerSecond;
+    }
+
+    private static class ClientWrapper<T> {
+        private final T client;
+        private final AtomicInteger refCount = new AtomicInteger(0);
+
+        /**
+         * Wraps the given client with a zero reference count.
+         *
+         * @param client the client to wrap
+         */
+
+
+        public ClientWrapper(T client) {
+            this.client = client;
+        }
+
+        @Override
+        public int hashCode() {
+            // the hash code of ClientWrapper is equal to MilvusClient hash code
+            return this.client.hashCode();
+        }
+
+        @Override
+        public boolean equals(Object obj) {
+            if (this == obj) return true;
+
+            if (obj == null) {
+                return false;
+            }
+
+            // obj is ClientWrapper
+            if (this.getClass() == obj.getClass()) {
+                return Objects.equals(this.client, ((ClientWrapper<?>) obj).client);
+            }
+
+            // obj is MilvusClient
+            if (this.client != null && this.client.getClass() == obj.getClass()) {
+                return Objects.equals(this.client, obj);
+            }
+            return false;
+        }
+
+        /**
+         * Returns the wrapped client, incrementing its reference count.
+         *
+         * @return the wrapped client
+         */
+
+
+        public T getClient() {
+            this.refCount.incrementAndGet();
+            return this.client;
+        }
+
+        /**
+         * Returns the wrapped client without changing its reference count.
+         *
+         * @return the wrapped client
+         */
+
+
+        public T getRawClient() {
+            return this.client;
+        }
+
+        /**
+         * Decrements the reference count of the wrapped client.
+         */
+
+
+        public void returnClient() {
+            this.refCount.decrementAndGet();
+        }
+
+        /**
+         * Returns the current reference count of the wrapped client.
+         *
+         * @return the reference count
+         */
+
+
+        public int getRefCount() {
+            return refCount.get();
+        }
+    }
+}

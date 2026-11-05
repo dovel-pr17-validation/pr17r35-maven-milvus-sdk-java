@@ -1,0 +1,362 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+package io.milvus.bulkwriter;
+
+import io.milvus.bulkwriter.common.clientenum.BulkFileType;
+import io.milvus.bulkwriter.common.clientenum.ConnectType;
+import io.milvus.bulkwriter.common.utils.V2AdapterUtils;
+import io.milvus.exception.ParamException;
+import io.milvus.param.ParamUtils;
+import io.milvus.param.collection.CollectionSchemaParam;
+import io.milvus.v2.service.collection.request.CreateCollectionReq;
+
+import java.util.HashMap;
+import java.util.Map;
+
+/**
+ * Zilliz Cloud only. Parameters for <code>volumeBulkWriter</code> interface.
+ *
+ * @zillizCloudOnly
+ */
+
+
+public class VolumeBulkWriterParam {
+    private final CreateCollectionReq.CollectionSchema collectionSchema;
+    private final String remotePath;
+    private final long chunkSize;
+    private final BulkFileType fileType;
+    private final Map<String, Object> config;
+
+    private final String cloudEndpoint;
+    private final String apiKey;
+    private final String volumeName;
+    private final ConnectType connectType;
+
+    private VolumeBulkWriterParam(Builder builder) {
+        this.collectionSchema = builder.collectionSchema;
+        this.remotePath = builder.remotePath;
+        this.chunkSize = builder.chunkSize;
+        this.fileType = builder.fileType;
+        this.config = builder.config;
+
+        this.cloudEndpoint = builder.cloudEndpoint;
+        this.apiKey = builder.apiKey;
+        this.volumeName = builder.volumeName;
+        this.connectType = builder.connectType;
+    }
+
+    /**
+    * Returns the collection schema.
+    *
+    * @return the collection schema
+    */
+
+
+    public CreateCollectionReq.CollectionSchema getCollectionSchema() {
+        return collectionSchema;
+    }
+
+    /**
+    * Returns the remote path where data files are uploaded.
+    *
+    * @return the remote path where data files are uploaded
+    */
+
+
+    public String getRemotePath() {
+        return remotePath;
+    }
+
+    /**
+    * Returns the chunk size threshold in bytes.
+    *
+    * @return the chunk size threshold in bytes
+    */
+
+
+    public long getChunkSize() {
+        return chunkSize;
+    }
+
+    /**
+    * Returns the bulk data file type.
+    *
+    * @return the bulk data file type
+    */
+
+
+    public BulkFileType getFileType() {
+        return fileType;
+    }
+
+    /**
+    * Returns the writer configuration map.
+    *
+    * @return the writer configuration map
+    */
+
+
+    public Map<String, Object> getConfig() {
+        return config;
+    }
+
+    /**
+    * Returns the cloud endpoint of the volume service.
+    *
+    * @return the cloud endpoint of the volume service
+    */
+
+
+    public String getCloudEndpoint() {
+        return cloudEndpoint;
+    }
+
+    /**
+    * Returns the API key for the volume service.
+    *
+    * @return the API key for the volume service
+    */
+
+
+    public String getApiKey() {
+        return apiKey;
+    }
+
+    /**
+    * Returns the name of the target volume.
+    *
+    * @return the name of the target volume
+    */
+
+
+    public String getVolumeName() {
+        return volumeName;
+    }
+
+    /**
+    * Returns the connection type for the volume service.
+    *
+    * @return the connection type for the volume service
+    */
+
+
+    public ConnectType getConnectType() {
+        return connectType;
+    }
+
+    @Override
+    public String toString() {
+        return "VolumeBulkWriterParam{" +
+                "collectionSchema=" + collectionSchema +
+                ", remotePath='" + remotePath + '\'' +
+                ", chunkSize=" + chunkSize +
+                ", fileType=" + fileType +
+                ", cloudEndpoint='" + cloudEndpoint + '\'' +
+                ", volumeName='" + volumeName + '\'' +
+                ", connectType=" + connectType +
+                '}';
+    }
+    /**
+     * Creates a new builder.
+     *
+     * @return the builder
+     */
+
+
+    public static Builder newBuilder() {
+        return new Builder();
+    }
+
+    /**
+     * Builder for {@link VolumeBulkWriterParam} class.
+     */
+
+
+    public static final class Builder {
+        private CreateCollectionReq.CollectionSchema collectionSchema;
+        private String remotePath;
+        private long chunkSize = 128 * 1024 * 1024;
+        private BulkFileType fileType = BulkFileType.PARQUET;
+        private final Map<String, Object> config = new HashMap<>();
+
+        private String cloudEndpoint;
+        private String apiKey;
+
+        private String volumeName;
+
+        private ConnectType connectType = ConnectType.AUTO;
+
+        private Builder() {
+        }
+
+        /**
+         * Sets the collection info.
+         *
+         * @param collectionSchema collection info
+         * @return <code>Builder</code>
+         */
+
+
+        public Builder withCollectionSchema(CollectionSchemaParam collectionSchema) {
+            this.collectionSchema = V2AdapterUtils.convertV1Schema(collectionSchema);
+            return this;
+        }
+
+        /**
+         * Sets the collection schema by V2.
+         *
+         * @param collectionSchema collection schema
+         * @return <code>Builder</code>
+         */
+
+
+        public Builder withCollectionSchema(CreateCollectionReq.CollectionSchema collectionSchema) {
+            this.collectionSchema = collectionSchema;
+            return this;
+        }
+
+        /**
+        * Sets the remote path where data files are uploaded.
+        *
+        * @param remotePath the remote path where data files are uploaded
+        * @return this builder
+        */
+
+
+        public Builder withRemotePath(String remotePath) {
+            this.remotePath = remotePath;
+            return this;
+        }
+
+        /**
+        * Sets the chunk size threshold in bytes.
+        *
+        * @param chunkSize the chunk size threshold in bytes
+        * @return this builder
+        */
+
+
+        public Builder withChunkSize(long chunkSize) {
+            this.chunkSize = chunkSize;
+            return this;
+        }
+
+        /**
+        * Sets the bulk data file type.
+        *
+        * @param fileType the bulk data file type
+        * @return this builder
+        */
+
+
+        public Builder withFileType(BulkFileType fileType) {
+            this.fileType = fileType;
+            return this;
+        }
+
+        /**
+        * Sets a writer configuration entry.
+        *
+        * @param key a writer configuration entry
+        * @param val the value
+        * @return this builder
+        */
+
+
+        public Builder withConfig(String key, Object val) {
+            this.config.put(key, val);
+            return this;
+        }
+
+        /**
+        * Sets the cloud endpoint of the volume service.
+        *
+        * @param cloudEndpoint the cloud endpoint of the volume service
+        * @return this builder
+        */
+
+
+        public Builder withCloudEndpoint(String cloudEndpoint) {
+            this.cloudEndpoint = cloudEndpoint;
+            return this;
+        }
+
+        /**
+        * Sets the API key for the volume service.
+        *
+        * @param apiKey the API key for the volume service
+        * @return this builder
+        */
+
+
+        public Builder withApiKey(String apiKey) {
+            this.apiKey = apiKey;
+            return this;
+        }
+
+        /**
+        * Sets the name of the target volume.
+        *
+        * @param volumeName the name of the target volume
+        * @return this builder
+        */
+
+
+        public Builder withVolumeName(String volumeName) {
+            this.volumeName = volumeName;
+            return this;
+        }
+
+        /**
+        * Sets the connection type for the volume service.
+        *
+        * @param connectType the connection type for the volume service
+        * @return this builder
+        */
+
+
+        public Builder withConnectType(ConnectType connectType) {
+            this.connectType = connectType;
+            return this;
+        }
+
+        /**
+         * Verifies parameters and creates a new {@link VolumeBulkWriterParam} instance.
+         *
+         * @return {@link VolumeBulkWriterParam}
+         * @throws ParamException if the required parameters are invalid
+         */
+
+
+        public VolumeBulkWriterParam build() throws ParamException {
+            ParamUtils.CheckNullEmptyString(remotePath, "localPath");
+
+            if (collectionSchema == null) {
+                throw new ParamException("collectionSchema cannot be null");
+            }
+            ParamUtils.CheckNullEmptyString(cloudEndpoint, "cloudEndpoint");
+            ParamUtils.CheckNullEmptyString(apiKey, "apiKey");
+            ParamUtils.CheckNullEmptyString(volumeName, "volumeName");
+
+            return new VolumeBulkWriterParam(this);
+        }
+    }
+
+}

@@ -1,0 +1,2908 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+package io.milvus.v2.client;
+
+import io.grpc.Channel;
+import io.grpc.ClientInterceptors;
+import io.grpc.ManagedChannel;
+import io.milvus.common.interceptor.ClientRequestInterceptor;
+import io.milvus.common.interceptor.IdentifierInterceptor;
+import io.milvus.grpc.ClientInfo;
+import io.milvus.grpc.ConnectRequest;
+import io.milvus.grpc.ConnectResponse;
+import io.milvus.grpc.MilvusServiceGrpc;
+import io.milvus.orm.iterator.QueryIterator;
+import io.milvus.orm.iterator.RpcStubWrapper;
+import io.milvus.orm.iterator.SearchIterator;
+import io.milvus.orm.iterator.SearchIteratorV2;
+import io.milvus.telemetry.ClientTelemetryManager;
+import io.milvus.telemetry.TelemetryInterceptor;
+import io.milvus.v2.service.cdc.CDCService;
+import io.milvus.v2.service.cdc.request.DumpMessagesReq;
+import io.milvus.v2.service.cdc.request.GetReplicateInfoReq;
+import io.milvus.v2.service.cdc.request.UpdateReplicateConfigurationReq;
+import io.milvus.v2.service.cdc.response.DumpMessagesResp;
+import io.milvus.v2.service.cdc.response.GetReplicateConfigurationResp;
+import io.milvus.v2.service.cdc.response.GetReplicateInfoResp;
+import io.milvus.v2.service.cdc.response.UpdateReplicateConfigurationResp;
+import io.milvus.v2.service.collection.CollectionService;
+import io.milvus.v2.service.collection.request.*;
+import io.milvus.v2.service.collection.response.DescribeCollectionResp;
+import io.milvus.v2.service.collection.response.DescribeReplicasResp;
+import io.milvus.v2.service.collection.response.GetCollectionStatsResp;
+import io.milvus.v2.service.collection.response.GetLoadStateResp;
+import io.milvus.v2.service.collection.response.ListCollectionsResp;
+import io.milvus.v2.service.database.DatabaseService;
+import io.milvus.v2.service.database.request.*;
+import io.milvus.v2.service.database.response.DescribeDatabaseResp;
+import io.milvus.v2.service.database.response.ListDatabasesResp;
+import io.milvus.v2.service.index.IndexService;
+import io.milvus.v2.service.index.request.*;
+import io.milvus.v2.service.index.response.DescribeIndexResp;
+import io.milvus.v2.service.partition.PartitionService;
+import io.milvus.v2.service.partition.request.*;
+import io.milvus.v2.service.partition.response.GetPartitionStatsResp;
+import io.milvus.v2.service.rbac.RBACService;
+import io.milvus.v2.service.rbac.request.*;
+import io.milvus.v2.service.rbac.response.DescribeRoleResp;
+import io.milvus.v2.service.rbac.response.DescribeUserResp;
+import io.milvus.v2.service.rbac.response.ListPrivilegeGroupsResp;
+import io.milvus.v2.service.resourcegroup.ResourceGroupService;
+import io.milvus.v2.service.resourcegroup.request.*;
+import io.milvus.v2.service.resourcegroup.response.DescribeResourceGroupResp;
+import io.milvus.v2.service.resourcegroup.response.ListResourceGroupsResp;
+import io.milvus.v2.service.rls.RLSService;
+import io.milvus.v2.service.rls.request.*;
+import io.milvus.v2.service.rls.response.GetRLSPrincipalTagsResp;
+import io.milvus.v2.service.rls.response.ListRLSPrincipalsResp;
+import io.milvus.v2.service.rls.response.ListRowPoliciesResp;
+import io.milvus.v2.service.snapshot.SnapshotService;
+import io.milvus.v2.service.snapshot.request.*;
+import io.milvus.v2.service.snapshot.response.*;
+import io.milvus.v2.service.utility.OptimizeTask;
+import io.milvus.v2.service.utility.UtilityService;
+import io.milvus.v2.service.utility.request.*;
+import io.milvus.v2.service.utility.response.*;
+import io.milvus.v2.service.vector.VectorService;
+import io.milvus.v2.service.vector.request.*;
+import io.milvus.v2.service.vector.response.*;
+import io.milvus.v2.client.globalcluster.GlobalClusterUtils;
+import io.milvus.v2.client.globalcluster.GlobalStub;
+import io.milvus.v2.utils.ClientUtils;
+import io.milvus.v2.utils.RpcUtils;
+import org.apache.commons.lang3.StringUtils;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import io.milvus.v2.common.CompactionState;
+import io.milvus.v2.common.IndexBuildState;
+import io.milvus.v2.exception.ErrorCode;
+import io.milvus.v2.exception.MilvusClientException;
+
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Supplier;
+
+import static io.milvus.common.utils.RedactCredential.redactUriUserInfo;
+
+/**
+ * Client for interacting with Milvus through the V2 API.
+ *
+ * <h2>Thread safety</h2>
+ * After client construction succeeds, RPC methods may be called concurrently on the same client while its
+ * connection and database state remain unchanged. Methods that change or close that state, including
+ * {@link #useDatabase(String)}, {@link #close()}, {@link #close(long)}, and
+ * {@link #updatePassword(UpdatePasswordReq)} when connection reset is requested, must be serialized with all other
+ * operations. Do not call these methods, or otherwise discard the client, while RPCs are in flight.
+ * <p>
+ * Concurrent DML and DQL operations are supported. A DQL operation that overlaps a DML operation is not guaranteed
+ * to observe that write; wait for the DML operation to complete and use the appropriate consistency level when this
+ * ordering is required. DDL operations that change a database or collection's lifecycle or schema, such as drop,
+ * rename, truncate, or schema alteration, must not run concurrently with DML or DQL operations on the affected
+ * database or collection. Serialize these operations to avoid undefined ordering and unexpected results.
+ */
+
+
+public class MilvusClientV2 {
+    private static final Logger logger = LoggerFactory.getLogger(MilvusClientV2.class);
+    private ManagedChannel channel;
+    private volatile MilvusServiceGrpc.MilvusServiceBlockingStub blockingStub;
+    private volatile MilvusServiceGrpc.MilvusServiceFutureStub futureStub;
+    private final ClientUtils clientUtils = new ClientUtils();
+    private final DatabaseService databaseService = new DatabaseService();
+    private final CollectionService collectionService = new CollectionService();
+    private final IndexService indexService = new IndexService();
+    private final VectorService vectorService = new VectorService();
+    private final PartitionService partitionService = new PartitionService();
+    private final RBACService rbacService = new RBACService();
+    private final ResourceGroupService rgroupService = new ResourceGroupService();
+    private final SnapshotService snapshotService = new SnapshotService();
+    private final UtilityService utilityService = new UtilityService();
+    private final CDCService cdcService = new CDCService();
+    private final RLSService rlsService = new RLSService();
+    private RpcUtils rpcUtils = new RpcUtils();
+    private ConnectConfig connectConfig;
+    private GlobalStub globalStub;
+    private String cacheEndpoint = "";
+    private ClientTelemetryManager telemetry;
+
+    /**
+     * Creates a Milvus client instance.
+     *
+     * @param connectConfig Milvus server connection configuration
+     */
+
+
+    public MilvusClientV2(ConnectConfig connectConfig) {
+        this(connectConfig, true);
+    }
+
+    private MilvusClientV2(ConnectConfig connectConfig, boolean activateGlobalStub) {
+        if (connectConfig != null) {
+            connect(connectConfig);
+
+            initServices(connectConfig.getDbName());
+            if (activateGlobalStub && globalStub != null) {
+                globalStub.activate();
+            }
+        }
+    }
+
+    /**
+     * Sets the blocking gRPC stub used for synchronous RPC calls.
+     * Primarily used by tests and internal client wiring.
+     *
+     * @param blockingStub the blocking gRPC stub
+     */
+
+
+    public void setBlockingStub(MilvusServiceGrpc.MilvusServiceBlockingStub blockingStub) {
+        this.blockingStub = blockingStub;
+    }
+
+    /**
+     * Sets the future gRPC stub used for asynchronous RPC calls.
+     * Primarily used by tests and internal client wiring.
+     *
+     * @param futureStub the future gRPC stub
+     */
+
+
+    public void setFutureStub(MilvusServiceGrpc.MilvusServiceFutureStub futureStub) {
+        this.futureStub = futureStub;
+    }
+
+    private void initServices(String dbName) {
+        String endpoint = cacheEndpoint;
+        this.databaseService.setEndpoint(endpoint);
+        this.collectionService.setEndpoint(endpoint);
+        this.collectionService.indexService.setEndpoint(endpoint);
+        this.indexService.setEndpoint(endpoint);
+        this.vectorService.setEndpoint(endpoint);
+        this.partitionService.setEndpoint(endpoint);
+        this.rbacService.setEndpoint(endpoint);
+        this.rgroupService.setEndpoint(endpoint);
+        this.snapshotService.setEndpoint(endpoint);
+        this.utilityService.setEndpoint(endpoint);
+        this.cdcService.setEndpoint(endpoint);
+        this.rlsService.setEndpoint(endpoint);
+        this.databaseService.setCurrentDbName(dbName);
+        this.collectionService.setCurrentDbName(dbName);
+        this.indexService.setCurrentDbName(dbName);
+        this.vectorService.setCurrentDbName(dbName);
+        this.partitionService.setCurrentDbName(dbName);
+        this.rbacService.setCurrentDbName(dbName);
+        this.rgroupService.setCurrentDbName(dbName);
+        this.snapshotService.setCurrentDbName(dbName);
+        this.utilityService.setCurrentDbName(dbName);
+        this.rlsService.setCurrentDbName(dbName);
+    }
+
+    /**
+     * connect to Milvus server
+     *
+     * @param connectConfig Milvus server connection configuration
+     */
+    private void connect(ConnectConfig connectConfig) {
+        this.connectConfig = connectConfig;
+        this.cacheEndpoint = connectConfig.getHost() + ":" + connectConfig.getPort();
+
+        // Check if this is a global cluster endpoint
+        if (GlobalClusterUtils.isGlobalEndpoint(connectConfig.getUri())) {
+            logger.info("Detected global cluster endpoint: {}", redactUriUserInfo(connectConfig.getUri()));
+            this.globalStub = new GlobalStub(connectConfig.getUri(), connectConfig, this::updatePrimaryConnection);
+            updatePrimaryConnection(this.globalStub.getPrimaryClient());
+            // Set up the global refresh trigger on RpcUtils for UNAVAILABLE errors
+            this.rpcUtils.setGlobalRefreshTrigger(() -> {
+                if (globalStub != null) {
+                    globalStub.triggerRefresh();
+                }
+            });
+            return;
+        }
+
+        if (connectConfig.isEnablePrecheck()) {
+            clientUtils.validateHostname(connectConfig);
+            clientUtils.validatePort(connectConfig);
+            clientUtils.validateCert(connectConfig);
+        }
+        try {
+            if (this.channel != null) {
+                // close channel first
+                close(3);
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new RuntimeException(e);
+        }
+        ClientTelemetryManager.RuntimeState telemetryRuntimeState = connectConfig.takeTelemetryRuntimeState();
+        String runtimeClientId = telemetryRuntimeState == null
+                ? connectConfig.getTelemetryClientId() : telemetryRuntimeState.getClientId();
+        telemetry = new ClientTelemetryManager(
+                connectConfig.getTelemetryConfig(),
+                connectConfig.getUsername(),
+                clientUtils.getSDKVersion(),
+                this::configuredDatabaseName,
+                this::telemetryUserConfig,
+                runtimeClientId);
+        telemetry.restoreRuntimeState(telemetryRuntimeState);
+        connectConfig.setTelemetryClientId(telemetry.getClientId());
+        channel = clientUtils.getChannel(connectConfig,
+                new TelemetryInterceptor(telemetry, connectConfig.getClientRequestId()));
+
+        try {
+            blockingStub = MilvusServiceGrpc.newBlockingStub(channel).withWaitForReady();
+            long identifier = connect(connectConfig, blockingStub);
+
+            // Wrap channel with identifier interceptor so that every subsequent RPC
+            // carries the identifier in gRPC metadata, aligning with pymilvus behavior.
+            Channel interceptedChannel = ClientInterceptors.intercept(channel,
+                    new IdentifierInterceptor(identifier));
+            blockingStub = MilvusServiceGrpc.newBlockingStub(interceptedChannel).withWaitForReady();
+            futureStub = MilvusServiceGrpc.newFutureStub(interceptedChannel).withWaitForReady();
+            telemetry.setStub(io.milvus.grpc.ClientTelemetryServiceGrpc.newBlockingStub(interceptedChannel));
+            if (!connectConfig.isDeferTelemetryStart()) {
+                telemetry.start();
+            }
+
+            if (connectConfig.getDbName() != null) {
+                // check if database exists
+                clientUtils.checkDatabaseExist(this.blockingStub, connectConfig.getDbName());
+            }
+        } catch (Exception e) {
+            // close the channel if connect() and checkDatabaseExist() throws exception, avoid leakage
+            try {
+                close(3);
+            } catch (InterruptedException ignored) {
+                Thread.currentThread().interrupt();
+            }
+            throw e;
+        }
+    }
+
+    private synchronized void updatePrimaryConnection(MilvusClientV2 primaryClient) {
+        this.channel = primaryClient.channel;
+        this.blockingStub = primaryClient.blockingStub;
+        this.futureStub = primaryClient.futureStub;
+        this.telemetry = primaryClient.telemetry;
+        if (connectConfig != null && telemetry != null) {
+            connectConfig.setTelemetryClientId(telemetry.getClientId());
+        }
+        // Keep cacheEndpoint scoped to the logical global-cluster endpoint. Replacing it with the
+        // physical primary endpoint would make session timestamps and schemas recorded before a
+        // failover unreachable after the primary changes.
+        if (connectConfig != null) {
+            initServices(connectConfig.getDbName());
+        }
+    }
+
+    /** Starts a telemetry manager whose worker was intentionally deferred during connection setup. */
+
+
+    public void startTelemetry() {
+        ClientTelemetryManager manager = getTelemetry();
+        if (manager != null) {
+            manager.start();
+        }
+    }
+
+    // The withDeadlineAfter() need to be reset for each RPC call.
+    // If we set a blockingStub for multiple rpc calls, it eventually will timeout since the timeout is calculated
+    // begin the first call and end with the last call.
+    // A related discussion: https://github.com/grpc/grpc-java/issues/4305
+    private MilvusServiceGrpc.MilvusServiceBlockingStub getRpcStub() {
+        if (blockingStub == null) {
+            throw new MilvusClientException(ErrorCode.CLIENT_ERROR, "MilvusClient is closed");
+        }
+        if (connectConfig != null && connectConfig.getRpcDeadlineMs() > 0) {
+            return blockingStub.withDeadlineAfter(connectConfig.getRpcDeadlineMs(), TimeUnit.MILLISECONDS);
+        } else {
+            return blockingStub;
+        }
+    }
+
+    private MilvusServiceGrpc.MilvusServiceFutureStub getFutureRpcStub() {
+        if (futureStub == null) {
+            throw new MilvusClientException(ErrorCode.CLIENT_ERROR, "MilvusClient is closed");
+        }
+        if (connectConfig != null && connectConfig.getRpcDeadlineMs() > 0) {
+            return futureStub.withDeadlineAfter(connectConfig.getRpcDeadlineMs(), TimeUnit.MILLISECONDS);
+        } else {
+            return futureStub;
+        }
+    }
+
+    private MilvusServiceGrpc.MilvusServiceFutureStub getFutureRpcStub(String clientRequestId) {
+        return getFutureRpcStub().withOption(
+                ClientRequestInterceptor.CLIENT_REQUEST_ID_OPTION,
+                clientRequestId == null ? "" : clientRequestId).withOption(
+                TelemetryInterceptor.LOGICAL_OPERATION_OPTION, true);
+    }
+
+    private String captureClientRequestId() {
+        if (connectConfig == null || connectConfig.getClientRequestId() == null) {
+            return "";
+        }
+        String requestId = connectConfig.getClientRequestId().get();
+        return requestId == null ? "" : requestId;
+    }
+
+    private String captureTelemetryRequestId() {
+        String requestId = captureClientRequestId();
+        return ClientRequestInterceptor.isValidClientRequestId(requestId) ? requestId : "";
+    }
+
+    private <T> T recordLogicalOperation(
+            String operation, String collection, Supplier<T> supplier) {
+        ClientTelemetryManager manager = getTelemetry();
+        if (manager == null) {
+            return supplier.get();
+        }
+        long startNanos = System.nanoTime();
+        String requestId = captureTelemetryRequestId();
+        try (ClientTelemetryManager.LogicalOperationScope ignored =
+                     manager.beginLogicalOperation()) {
+            T result = supplier.get();
+            recordLogicalResult(manager, operation, collection, startNanos, "", requestId);
+            return result;
+        } catch (RuntimeException | Error throwable) {
+            recordLogicalResult(manager, operation, collection, startNanos,
+                    telemetryError(throwable), requestId);
+            throw throwable;
+        }
+    }
+
+    private <T> CompletableFuture<T> recordLogicalOperationAsync(
+            String operation, String collection, Supplier<CompletableFuture<T>> supplier) {
+        ClientTelemetryManager manager = getTelemetry();
+        if (manager == null) {
+            return supplier.get();
+        }
+        long startNanos = System.nanoTime();
+        String requestId = captureTelemetryRequestId();
+        final CompletableFuture<T> future;
+        try (ClientTelemetryManager.LogicalOperationScope ignored =
+                     manager.beginLogicalOperation()) {
+            future = supplier.get();
+        } catch (RuntimeException | Error throwable) {
+            recordLogicalResult(manager, operation, collection, startNanos,
+                    telemetryError(throwable), requestId);
+            throw throwable;
+        }
+        future.whenComplete((result, throwable) -> recordLogicalResult(manager,
+                operation,
+                collection,
+                startNanos,
+                throwable == null ? "" : telemetryError(throwable),
+                requestId));
+        return future;
+    }
+
+    private static void recordLogicalResult(
+            ClientTelemetryManager manager, String operation, String collection,
+            long startNanos, String error, String requestId) {
+        try {
+            manager.recordOperation(operation, collection, startNanos, error, requestId);
+        } catch (RuntimeException ignored) {
+            // Telemetry is best-effort and must never replace the operation result.
+        }
+    }
+
+    private static String telemetryError(Throwable throwable) {
+        Throwable current = throwable;
+        while (current instanceof CompletionException && current.getCause() != null) {
+            current = current.getCause();
+        }
+        return current.toString();
+    }
+
+    /**
+     * This method is internal used, it calls a RPC Connect() to the remote server,
+     * and sends the client info to the server so that the server knows which client is interacting,
+     * especially for accesses log.
+     * <p>
+     * The info includes:
+     * 1. username(if Authentication is enabled)
+     * 2. the client computer's name
+     * 3. sdk language type and version
+     * 4. the client's local time
+     */
+    private long connect(ConnectConfig connectConfig, MilvusServiceGrpc.MilvusServiceBlockingStub blockingStub) {
+        String userName = connectConfig.getUsername();
+        if (userName == null) {
+            userName = ""; // ClientInfo.setUser() requires non-null value
+        }
+
+        ClientInfo.Builder infoBuilder = ClientInfo.newBuilder()
+                .setSdkType("Java")
+                .setSdkVersion(clientUtils.getSDKVersion())
+                .setUser(userName)
+                .setHost(clientUtils.getHostName())
+                .setLocalTime(clientUtils.getLocalTimeStr());
+        if (connectConfig.getOption() != null && !connectConfig.getOption().isEmpty()) {
+            infoBuilder.putAllReserved(connectConfig.getOption());
+        }
+        ClientInfo info = infoBuilder.build();
+        ConnectRequest req = ConnectRequest.newBuilder().setClientInfo(info).build();
+        ConnectResponse resp = blockingStub.withDeadlineAfter(connectConfig.getConnectTimeoutMs(), TimeUnit.MILLISECONDS)
+                .connect(req);
+        if (resp.getStatus().getCode() != 0 || !resp.getStatus().getErrorCode().equals(io.milvus.grpc.ErrorCode.Success)) {
+            throw new RuntimeException("Failed to initialize connection. Error: " + resp.getStatus().getReason());
+        }
+        return resp.getIdentifier();
+    }
+
+    /**
+     * Configures the retry policy used for RPC calls.
+     *
+     * @param retryConfig the retry configuration
+     */
+
+
+    public void retryConfig(RetryConfig retryConfig) {
+        rpcUtils.retryConfig(retryConfig);
+    }
+
+    /**
+     * Configures the retry policy used for RPC calls and returns this client for chaining.
+     *
+     * @param retryConfig the retry configuration
+     * @return this client
+     */
+
+
+    public MilvusClientV2 withRetry(RetryConfig retryConfig) {
+        rpcUtils.retryConfig(retryConfig);
+        return this;
+    }
+
+    /**
+     * Sets the RPC deadline for all subsequent calls and returns this client for chaining.
+     * A timeout value smaller than 1ms is treated as 1ms; a value of zero disables the deadline.
+     *
+     * @param timeout the timeout value
+     * @param timeoutUnit the unit of the timeout value
+     * @return this client
+     */
+
+
+    public MilvusClientV2 withTimeout(long timeout, TimeUnit timeoutUnit) {
+        // the unit of rpcDeadlineMs is millisecond
+        // if the input timeout value is zero, rpcDeadlineMs is zero
+        // if the input timeout value is not zero and less than 1ms, it will be treated as 1ms
+        // if the input timeout value is larger than 1ms, it will be converted to an integer ms value
+        long nn = timeoutUnit.toNanos(timeout);
+        long ms = (nn == 0) ? 0 : (nn < 1000000 ? 1 : nn / 1000000);
+        connectConfig.setRpcDeadlineMs(ms);
+        return this;
+    }
+
+    /**
+     * Returns the database currently in use by this client.
+     * Returns {@code "default"} when no database has been configured.
+     *
+     * @return the current database name
+     */
+
+
+    public String currentUsedDatabase() {
+        String dbName = this.connectConfig.getDbName();
+        if (StringUtils.isEmpty(dbName)) {
+            return "default";
+        }
+        return dbName;
+    }
+
+    private String configuredDatabaseName() {
+        return connectConfig == null ? null : connectConfig.getDbName();
+    }
+
+    /**
+     * Returns the telemetry manager for metrics inspection and custom command handlers.
+     *
+     * @return the telemetry manager
+     */
+
+
+    public ClientTelemetryManager getTelemetry() {
+        if (globalStub != null) {
+            MilvusClientV2 primaryClient = globalStub.getPrimaryClient();
+            return primaryClient == null ? null : primaryClient.getTelemetry();
+        }
+        return telemetry;
+    }
+
+    private Map<String, Object> telemetryUserConfig() {
+        Map<String, Object> result = new LinkedHashMap<>();
+        if (connectConfig == null) {
+            return result;
+        }
+        result.put("address", connectConfig.getHost() + ":" + connectConfig.getPort());
+        result.put("username", connectConfig.getUsername());
+        result.put("db_name", connectConfig.getDbName());
+        result.put("secure", connectConfig.isSecure());
+        result.put("connect_timeout_ms", connectConfig.getConnectTimeoutMs());
+        result.put("rpc_deadline_ms", connectConfig.getRpcDeadlineMs());
+        result.put("current_db", currentUsedDatabase());
+        return result;
+    }
+
+    /**
+     * Zilliz Cloud only. Creates a session bound to the given cluster ID for cluster-level operations.
+     *
+     * @param clusterId the cluster ID to bind the session to
+     * @return a new session bound to the given cluster
+     * @throws MilvusClientException if the cluster ID is null or empty
+     * @zillizCloudOnly
+     */
+
+
+    public MilvusClientV2Session session(String clusterId) {
+        if (StringUtils.isEmpty(clusterId)) {
+            throw new MilvusClientException(ErrorCode.INVALID_PARAMS, "clusterId cannot be null or empty");
+        }
+        return new MilvusClientV2Session(this, clusterId);
+    }
+
+
+    /////////////////////////////////////////////////////////////////////////////////////////////
+    // Database Operations
+    /////////////////////////////////////////////////////////////////////////////////////////////
+    /**
+     * Switches the client to operate on the specified database.
+     *
+     * <p>Subsequent operations run against the new database without disconnecting from
+     * Milvus.</p>
+     *
+     * @param dbName the name of the database to use
+     * @throws InterruptedException if interrupted while closing the previous connection
+     */
+
+    public void useDatabase(String dbName) throws InterruptedException {
+        if (dbName == null) {
+            throw new IllegalArgumentException("dbName cannot be null");
+        }
+        if (connectConfig != null && dbName.equals(connectConfig.getDbName())) {
+            return;
+        }
+
+        ClientTelemetryManager oldTelemetry = getTelemetry();
+        String telemetryClientId = oldTelemetry == null
+                ? connectConfig.getTelemetryClientId() : oldTelemetry.getClientId();
+        ConnectConfig candidateConfig = copyConnectConfigForDatabase(
+                connectConfig, dbName, telemetryClientId);
+        // Construct and validate the replacement before fencing or mutating the active client.
+        MilvusClientV2 candidate = createDatabaseCandidate(candidateConfig);
+        ClientTelemetryManager newTelemetry = candidate.getTelemetry();
+        ManagedChannel oldChannel = this.channel;
+        MilvusServiceGrpc.MilvusServiceBlockingStub oldBlockingStub = this.blockingStub;
+        MilvusServiceGrpc.MilvusServiceFutureStub oldFutureStub = this.futureStub;
+        ConnectConfig oldConfig = this.connectConfig;
+        GlobalStub oldGlobalStub = this.globalStub;
+        String oldCacheEndpoint = this.cacheEndpoint;
+        long retirementToken = 0L;
+        boolean retirementPending = false;
+        try {
+            if (oldTelemetry != null) {
+                if (newTelemetry == null) {
+                    throw new IllegalStateException("replacement client has no telemetry manager");
+                }
+                newTelemetry.prepareRuntimeStateHandoffFrom(oldTelemetry);
+                retirementToken = oldTelemetry.beginRuntimeStateRetirement();
+                retirementPending = true;
+            }
+
+            this.channel = candidate.channel;
+            this.blockingStub = candidate.blockingStub;
+            this.futureStub = candidate.futureStub;
+            this.connectConfig = candidate.connectConfig;
+            this.globalStub = candidate.globalStub;
+            this.cacheEndpoint = candidate.cacheEndpoint;
+            this.telemetry = candidate.telemetry;
+            if (this.globalStub != null) {
+                this.globalStub.retargetPrimaryChange(this::updatePrimaryConnection);
+                this.rpcUtils.setGlobalRefreshTrigger(() -> {
+                    if (globalStub != null) {
+                        globalStub.triggerRefresh();
+                    }
+                });
+            } else {
+                this.rpcUtils.setGlobalRefreshTrigger(null);
+            }
+            this.initServices(dbName);
+
+            if (oldTelemetry != null) {
+                oldTelemetry.handoffRuntimeStateTo(newTelemetry, retirementToken);
+                retirementPending = false;
+            } else {
+                candidate.startTelemetry();
+            }
+            // Preserve the caller-visible ConnectConfig identity used by the existing API,
+            // but mutate it only after the replacement and telemetry handoff have committed.
+            oldConfig.setDbName(dbName);
+            if (newTelemetry != null) {
+                oldConfig.setTelemetryClientId(newTelemetry.getClientId());
+            }
+            this.connectConfig = oldConfig;
+            candidate.connectConfig = oldConfig;
+            if (candidate.globalStub != null) {
+                candidate.globalStub.activate();
+            }
+        } catch (RuntimeException | Error exception) {
+            this.channel = oldChannel;
+            this.blockingStub = oldBlockingStub;
+            this.futureStub = oldFutureStub;
+            this.connectConfig = oldConfig;
+            this.globalStub = oldGlobalStub;
+            this.cacheEndpoint = oldCacheEndpoint;
+            this.telemetry = oldTelemetry;
+            if (this.globalStub != null) {
+                this.rpcUtils.setGlobalRefreshTrigger(() -> {
+                    if (globalStub != null) {
+                        globalStub.triggerRefresh();
+                    }
+                });
+            } else {
+                this.rpcUtils.setGlobalRefreshTrigger(null);
+            }
+            this.initServices(oldConfig.getDbName());
+            if (newTelemetry != null && oldTelemetry != null) {
+                newTelemetry.cancelRuntimeStateHandoffFrom(oldTelemetry);
+            }
+            if (retirementPending && oldTelemetry != null) {
+                oldTelemetry.cancelRuntimeStateRetirement(retirementToken);
+            }
+            try {
+                candidate.close();
+            } catch (Exception closeException) {
+                exception.addSuppressed(closeException);
+            }
+            throw exception;
+        }
+
+        // The replacement now owns the public stubs. Dispose only resources that were
+        // owned by the discarded outer/candidate connection; telemetry was closed by handoff.
+        candidate.rpcUtils.shutdown();
+        if (oldGlobalStub != null) {
+            try {
+                oldGlobalStub.close();
+            } catch (RuntimeException exception) {
+                logger.warn("Failed to close the previous global connection", exception);
+            }
+        } else if (oldChannel != null) {
+            try {
+                oldChannel.shutdownNow();
+                oldChannel.awaitTermination(3, TimeUnit.SECONDS);
+            } catch (InterruptedException exception) {
+                Thread.currentThread().interrupt();
+                logger.warn("Interrupted while closing the previous database connection", exception);
+            } catch (RuntimeException exception) {
+                logger.warn("Failed to close the previous database connection", exception);
+            }
+        }
+    }
+
+    MilvusClientV2 createDatabaseCandidate(ConnectConfig config) {
+        return new MilvusClientV2(config, false);
+    }
+
+    private static ConnectConfig copyConnectConfigForDatabase(
+            ConnectConfig original, String dbName, String telemetryClientId) {
+        ConnectConfig.ConnectConfigBuilder builder = ConnectConfig.builder()
+                .uri(original.getUri())
+                .token(original.getToken())
+                .dbName(dbName);
+        if (original.getUsername() != null) {
+            builder.username(original.getUsername());
+        }
+        if (original.getPassword() != null) {
+            builder.password(original.getPassword());
+        }
+        return builder
+                .connectTimeoutMs(original.getConnectTimeoutMs())
+                .keepAliveTimeMs(original.getKeepAliveTimeMs())
+                .keepAliveTimeoutMs(original.getKeepAliveTimeoutMs())
+                .keepAliveWithoutCalls(original.isKeepAliveWithoutCalls())
+                .rpcDeadlineMs(original.getRpcDeadlineMs())
+                .clientKeyPath(original.getClientKeyPath())
+                .clientPemPath(original.getClientPemPath())
+                .caPemPath(original.getCaPemPath())
+                .serverPemPath(original.getServerPemPath())
+                .serverName(original.getServerName())
+                .proxyAddress(original.getProxyAddress())
+                .secure(original.getSecure())
+                .idleTimeoutMs(original.getIdleTimeoutMs())
+                .sslContext(original.getSslContext())
+                .clientRequestId(original.getClientRequestId())
+                .telemetryConfig(original.getTelemetryConfig())
+                .telemetryClientId(telemetryClientId)
+                .deferTelemetryStart(true)
+                .enablePrecheck(original.isEnablePrecheck())
+                .option(original.getOption() == null
+                        ? new LinkedHashMap<>() : new LinkedHashMap<>(original.getOption()))
+                .build();
+    }
+
+    /**
+     * Creates a database in Milvus.
+     *
+     * <p>A database is a logical unit above collections for organizing data and supporting
+     * multi-tenancy. The request may carry properties such as {@code database.replica.number}
+     * to be applied to the new database.</p>
+     *
+     * @param request the create database request
+     */
+
+
+    public void createDatabase(CreateDatabaseReq request) {
+        rpcUtils.retry(() -> databaseService.createDatabase(this.getRpcStub(), request));
+    }
+
+    /**
+     * Drops a database and all data in it.
+     *
+     * <p>The default database cannot be dropped, and all collections in the database must
+     * be dropped first.</p>
+     *
+     * @param request the drop database request
+     */
+
+
+    public void dropDatabase(DropDatabaseReq request) {
+        rpcUtils.retry(() -> databaseService.dropDatabase(this.getRpcStub(), request));
+    }
+
+    /**
+     * Lists all databases in the current instance.
+     *
+     * @return the list of database names
+     */
+
+
+    public ListDatabasesResp listDatabases() {
+        return rpcUtils.retry(() -> databaseService.listDatabases(this.getRpcStub()));
+    }
+
+    /**
+     * Alter database with key value pair. (Available from Milvus v2.4.4)
+     * Deprecated, replaced by alterDatabaseProperties from SDK v2.5.3, to keep consistence with other SDKs
+     *
+     * @param request alter database request
+     * @deprecated since SDK v2.5.3, replaced by {@link #alterDatabaseProperties(AlterDatabasePropertiesReq)}
+     */
+    @Deprecated
+    public void alterDatabase(AlterDatabaseReq request) {
+        alterDatabaseProperties(AlterDatabasePropertiesReq.builder()
+                .databaseName(request.getDatabaseName())
+                .properties(request.getProperties())
+                .build());
+    }
+
+    /**
+     * Alters the properties of an existing database.
+     *
+     * <p>Possible properties include {@code database.replica.number},
+     * {@code database.resource_groups}, {@code database.diskQuota.mb} and
+     * {@code database.max.collections}.</p>
+     *
+     * @param request the alter database properties request
+     */
+
+
+    public void alterDatabaseProperties(AlterDatabasePropertiesReq request) {
+        rpcUtils.retry(() -> databaseService.alterDatabaseProperties(this.getRpcStub(), request));
+    }
+
+    /**
+     * Drops (resets) the specified properties of a database so they return to their defaults.
+     *
+     * @param request the drop database properties request
+     */
+
+
+    public void dropDatabaseProperties(DropDatabasePropertiesReq request) {
+        rpcUtils.retry(() -> databaseService.dropDatabaseProperties(this.getRpcStub(), request));
+    }
+
+    /**
+     * Shows the details of a database, such as replica number and associated resource groups.
+     * (Available from Milvus v2.4.4)
+     *
+     * @param request the describe database request
+     * @return the database details
+     */
+
+
+    public DescribeDatabaseResp describeDatabase(DescribeDatabaseReq request) {
+        return rpcUtils.retry(() -> databaseService.describeDatabase(this.getRpcStub(), request));
+    }
+
+    /////////////////////////////////////////////////////////////////////////////////////////////
+    // Collection Operations
+    /////////////////////////////////////////////////////////////////////////////////////////////
+    /**
+     * Creates a collection in Milvus.
+     *
+     * <p>If the request carries index parameters, Milvus automatically loads the collection
+     * upon creation. Data inserted later goes to the default {@code _default} partition unless
+     * a partition is specified.</p>
+     *
+     * @param request the create collection request
+     */
+
+    public void createCollection(CreateCollectionReq request) {
+        rpcUtils.retry(() -> collectionService.createCollection(this.getRpcStub(), request));
+    }
+
+    /**
+     * Creates a collection schema. This method is deprecated from v2.5.9, replaced by CreateSchema()
+     *
+     * @return CreateCollectionReq.CollectionSchema
+     * @deprecated since SDK v2.5.9, replaced by {@link #CreateSchema()}
+     */
+    @Deprecated
+    public CreateCollectionReq.CollectionSchema createSchema() {
+        return CollectionService.createSchema();
+    }
+
+    /**
+     * Creates an empty collection schema to which fields can be added.
+     *
+     * @return the collection schema
+     */
+
+
+    public static CreateCollectionReq.CollectionSchema CreateSchema() {
+        return CollectionService.createSchema();
+    }
+
+    /**
+     * List milvus collections in the current database of the connection
+     *
+     * @return the list of collection names
+     */
+
+
+    public ListCollectionsResp listCollections() {
+        return rpcUtils.retry(() -> collectionService.listCollections(this.getRpcStub(), ""));
+    }
+
+    /**
+     * List milvus collections, can specify the target database
+     * Note: the old API listCollections() doesn't have a ListCollectionsReq argument, we have to create
+     * this new V2 API to avoid incompatible issue.
+     *
+     * @param request list collections request
+     * @return the list of collection names
+     */
+
+
+    public ListCollectionsResp listCollectionsV2(ListCollectionsReq request) {
+        return rpcUtils.retry(() -> collectionService.listCollections(this.getRpcStub(), request.getDatabaseName()));
+    }
+
+    /**
+     * Drops a collection and all of its data, partitions, and indexes.
+     *
+     * @param request the drop collection request
+     */
+
+
+    public void dropCollection(DropCollectionReq request) {
+        rpcUtils.retry(() -> collectionService.dropCollection(this.getRpcStub(), request));
+    }
+
+    /**
+     * Truncates a collection in Milvus, removing all data while preserving the collection schema.
+     *
+     * @param request truncate collection request
+     */
+
+
+    public void truncateCollection(TruncateCollectionReq request) {
+        rpcUtils.retry(() -> collectionService.truncateCollection(this.getRpcStub(), request));
+    }
+
+    /**
+     * Alter a collection in Milvus.
+     * Deprecated, replaced by alterCollectionProperties from SDK v2.5.3, to keep consistence with other SDKs
+     *
+     * @param request alter collection request
+     * @deprecated since SDK v2.5.3, replaced by {@link #alterCollectionProperties(AlterCollectionPropertiesReq)}
+     */
+    @Deprecated
+    public void alterCollection(AlterCollectionReq request) {
+        alterCollectionProperties(AlterCollectionPropertiesReq.builder()
+                .collectionName(request.getCollectionName())
+                .databaseName(request.getDatabaseName())
+                .properties(request.getProperties())
+                .build());
+    }
+
+    /**
+     * Alter a collection's properties.
+     *
+     * @param request alter collection properties request
+     */
+
+
+    public void alterCollectionProperties(AlterCollectionPropertiesReq request) {
+        rpcUtils.retry(() -> collectionService.alterCollectionProperties(this.getRpcStub(), request));
+    }
+
+    /**
+     * Add a new field to collection.
+     *
+     * @param request add new field request
+     */
+
+
+    public void addCollectionField(AddCollectionFieldReq request) {
+        rpcUtils.retry(() -> collectionService.addCollectionField(this.getRpcStub(), request));
+    }
+
+    /**
+     * Add a new struct field to collection.
+     *
+     * @param request add new struct field request
+     */
+
+
+    public void addCollectionStructField(AddCollectionStructFieldReq request) {
+        rpcUtils.retry(() -> collectionService.addCollectionStructField(this.getRpcStub(), request));
+    }
+
+    /**
+     * Alter a field's properties.
+     *
+     * @param request alter field properties request
+     */
+
+
+    public void alterCollectionField(AlterCollectionFieldReq request) {
+        rpcUtils.retry(() -> collectionService.alterCollectionField(this.getRpcStub(), request));
+    }
+
+    /**
+     * Drop a field from collection.
+     *
+     * @param request drop field request
+     */
+
+
+    public void dropCollectionField(DropCollectionFieldReq request) {
+        rpcUtils.retry(() -> collectionService.dropCollectionField(this.getRpcStub(), request));
+    }
+
+    /**
+     * drop a collection's properties.
+     *
+     * @param request drop collection properties request
+     */
+
+
+    public void dropCollectionProperties(DropCollectionPropertiesReq request) {
+        rpcUtils.retry(() -> collectionService.dropCollectionProperties(this.getRpcStub(), request));
+    }
+
+    /**
+     * drop a field's properties.
+     *
+     * @param request drop field properties request
+     */
+
+
+    public void dropCollectionFieldProperties(DropCollectionFieldPropertiesReq request) {
+        rpcUtils.retry(() -> collectionService.dropCollectionFieldProperties(this.getRpcStub(), request));
+    }
+
+    /**
+     * Checks whether a collection exists in Milvus.
+     *
+     * @param request has collection request
+     * @return Boolean
+     */
+
+
+    public Boolean hasCollection(HasCollectionReq request) {
+        return rpcUtils.retry(() -> collectionService.hasCollection(this.getRpcStub(), request));
+    }
+
+    /**
+     * Gets the collection info in Milvus.
+     *
+     * @param request describe collection request
+     * @return DescribeCollectionResp
+     */
+
+
+    public DescribeCollectionResp describeCollection(DescribeCollectionReq request) {
+        return rpcUtils.retry(() -> collectionService.describeCollection(this.getRpcStub(), request));
+    }
+
+    /**
+     * Gets the collections info in Milvus.
+     *
+     * @param request describe collections request
+     * @return {@code List<DescribeCollectionResp>}
+     */
+
+
+    public List<DescribeCollectionResp> batchDescribeCollection(BatchDescribeCollectionReq request) {
+        return rpcUtils.retry(() -> collectionService.batchDescribeCollections(this.getRpcStub(), request));
+    }
+
+    /**
+     * Gets the statistics of a collection, such as row count, data and index sizes.
+     *
+     * @param request the get collection stats request
+     * @return the collection statistics
+     */
+
+
+    public GetCollectionStatsResp getCollectionStats(GetCollectionStatsReq request) {
+        return rpcUtils.retry(() -> collectionService.getCollectionStats(this.getRpcStub(), request));
+    }
+
+    /**
+     * Renames an existing collection to a new name.
+     *
+     * @param request the rename collection request
+     */
+
+
+    public void renameCollection(RenameCollectionReq request) {
+        rpcUtils.retry(() -> collectionService.renameCollection(this.getRpcStub(), request));
+    }
+
+    /**
+     * Loads a collection into memory.
+     *
+     * <p>Loading is a prerequisite for similarity searches and queries. The index files and raw
+     * data of all fields are loaded into memory; entities inserted afterwards are indexed and
+     * loaded automatically.</p>
+     *
+     * @param request the load collection request
+     */
+
+
+    public void loadCollection(LoadCollectionReq request) {
+        rpcUtils.retry(() -> collectionService.loadCollection(this.getRpcStub(), request));
+    }
+
+    /**
+     * Refresh loads a collection. Mainly used when there are new segments generated by bulkinsert request.
+     * Force the new segments to be loaded into memory.
+     * Note: unlike {@link #loadCollection(LoadCollectionReq)}, this interface always forces a refresh;
+     * the refresh flag is not configurable here.
+     *
+     * @param request refresh load collection request
+     */
+
+
+    public void refreshLoad(RefreshLoadReq request) {
+        rpcUtils.retry(() -> collectionService.refreshLoad(this.getRpcStub(), request));
+    }
+
+    /**
+     * Releases a collection from memory, freeing the resources used for search and query.
+     *
+     * @param request the release collection request
+     */
+
+
+    public void releaseCollection(ReleaseCollectionReq request) {
+        rpcUtils.retry(() -> collectionService.releaseCollection(this.getRpcStub(), request));
+    }
+
+    /**
+     * Checks whether a collection is loaded in Milvus.
+     *
+     * @param request the get load state request
+     * @return {@code true} if the collection is loaded, otherwise {@code false}
+     */
+
+
+    public Boolean getLoadState(GetLoadStateReq request) {
+        return rpcUtils.retry(() -> collectionService.getLoadState(this.getRpcStub(), request));
+    }
+
+    /**
+     * Gets the detailed load state of a collection or partition, such as its loading
+     * percentage and whether it is fully loaded.
+     *
+     * @param request the get load state request
+     * @return the detailed load state
+     */
+
+
+    public GetLoadStateResp getLoadStateV2(GetLoadStateReq request) {
+        return rpcUtils.retry(() -> collectionService.getLoadStateV2(this.getRpcStub(), request));
+    }
+
+    /**
+     * Get information of all replicas from a collection.
+     *
+     * @param request describe replicas request
+     * @return the replica information of the collection
+     */
+
+
+    public DescribeReplicasResp describeReplicas(DescribeReplicasReq request) {
+        return rpcUtils.retry(() -> collectionService.describeReplicas(this.getRpcStub(), request));
+    }
+
+    /**
+     * Adds a function to existing fields.
+     *
+     * Deprecated: Milvus 3.0 and later do not support adding a function separately. Use
+     * {@link #addFunctionField(AddFunctionFieldReq)} instead, which adds the function together
+     * with its output field and index.
+     *
+     * @param request add function request
+     * @deprecated since SDK v3.0.10, replaced by {@link #addFunctionField(AddFunctionFieldReq)}
+     */
+    @Deprecated
+    public void addCollectionFunction(AddCollectionFunctionReq request) {
+        rpcUtils.retry(() -> collectionService.addCollectionFunction(this.getRpcStub(), request));
+    }
+
+    /**
+     * Add a function-backed field to collection.
+     * The client supports BM25 functions with SparseFloatVector fields and MINHASH functions with
+     * BinaryVector fields. The request must include a bound index whose field name is empty or
+     * matches the field being added, with an index type other than None. AUTOINDEX is accepted and
+     * resolved by the server. Function output-field names are validated by the server.
+     *
+     * @param request add function field request
+     */
+
+
+    public void addFunctionField(AddFunctionFieldReq request) {
+        rpcUtils.retry(() -> collectionService.addFunctionField(this.getRpcStub(), request));
+    }
+
+    /**
+     * Alter a function of collection.
+     *
+     * @param request alter function request
+     */
+
+
+    public void alterCollectionFunction(AlterCollectionFunctionReq request) {
+        rpcUtils.retry(() -> collectionService.alterCollectionFunction(this.getRpcStub(), request));
+    }
+
+    /**
+     * Drops only the function definition and keeps its output field(s).
+     *
+     * Deprecated: Milvus 3.0 and later do not support dropping a function separately. Use
+     * {@link #dropFunctionField(DropFunctionFieldReq)} instead, which also removes the
+     * function's output field and its index.
+     *
+     * @param request drop function request
+     * @deprecated since SDK v3.0.10, replaced by {@link #dropFunctionField(DropFunctionFieldReq)}
+     */
+    @Deprecated
+    public void dropCollectionFunction(DropCollectionFunctionReq request) {
+        rpcUtils.retry(() -> collectionService.dropCollectionFunction(this.getRpcStub(), request));
+    }
+
+    /**
+     * Drop a function-backed field from collection.
+     * This removes the function and its output field(s), unlike dropCollectionFunction,
+     * which only drops the function definition.
+     *
+     * @param request drop function field request
+     */
+
+
+    public void dropFunctionField(DropFunctionFieldReq request) {
+        rpcUtils.retry(() -> collectionService.dropFunctionField(this.getRpcStub(), request));
+    }
+
+    /////////////////////////////////////////////////////////////////////////////////////////////
+    // Index Operations
+    /////////////////////////////////////////////////////////////////////////////////////////////
+    /**
+     * Creates an index for a specified field in a collection in Milvus.
+     *
+     * @param request create index request
+     */
+
+    public void createIndex(CreateIndexReq request) {
+        rpcUtils.retry(() -> indexService.createIndex(this.getRpcStub(), request));
+    }
+
+    /**
+     * Drops an index for a specified field in a collection in Milvus.
+     *
+     * @param request drop index request
+     */
+
+
+    public void dropIndex(DropIndexReq request) {
+        rpcUtils.retry(() -> indexService.dropIndex(this.getRpcStub(), request));
+    }
+
+    /**
+     * Alter an index in Milvus.
+     * Deprecated, replaced by alterIndexProperties from SDK v2.5.3, to keep consistence with other SDKs
+     *
+     * @param request alter index request
+     * @deprecated since SDK v2.5.3, replaced by {@link #alterIndexProperties(AlterIndexPropertiesReq)}
+     */
+    @Deprecated
+    public void alterIndex(AlterIndexReq request) {
+        alterIndexProperties(AlterIndexPropertiesReq.builder()
+                .collectionName(request.getCollectionName())
+                .databaseName(request.getDatabaseName())
+                .indexName(request.getIndexName())
+                .properties(request.getProperties())
+                .build());
+    }
+
+    /**
+     * Alter an index's properties.
+     *
+     * @param request alter index request
+     */
+
+
+    public void alterIndexProperties(AlterIndexPropertiesReq request) {
+        rpcUtils.retry(() -> indexService.alterIndexProperties(this.getRpcStub(), request));
+    }
+
+    /**
+     * drop an index's properties.
+     *
+     * @param request drop index properties request
+     */
+
+
+    public void dropIndexProperties(DropIndexPropertiesReq request) {
+        rpcUtils.retry(() -> indexService.dropIndexProperties(this.getRpcStub(), request));
+    }
+
+    /**
+     * Checks whether an index exists for a specified field in a collection in Milvus.
+     *
+     * @param request describe index request
+     * @return DescribeIndexResp
+     */
+
+
+    public DescribeIndexResp describeIndex(DescribeIndexReq request) {
+        return rpcUtils.retry(() -> indexService.describeIndex(this.getRpcStub(), request));
+    }
+
+    /**
+     * Lists all indexes in a collection in Milvus.
+     *
+     * @param request list indexes request
+     * @return List of String names of the indexes
+     */
+
+
+    public List<String> listIndexes(ListIndexesReq request) {
+        return rpcUtils.retry(() -> indexService.listIndexes(this.getRpcStub(), request));
+    }
+
+    /////////////////////////////////////////////////////////////////////////////////////////////
+    // Vector Operations
+    /////////////////////////////////////////////////////////////////////////////////////////////
+    /**
+     * Inserts entities into a collection.
+     *
+     * <p>Rows must include values for the required fields of the collection schema; nullable
+     * and auto-generated fields may be omitted. This operation does not check for duplicate
+     * primary keys; to update existing entities or avoid duplicates, use
+     * {@link #upsert(UpsertReq)} instead.</p>
+     *
+     * @param request the insert request
+     * @return the insert response containing the inserted count and generated primary keys
+     */
+
+    public InsertResp insert(InsertReq request) {
+        String collection = request == null ? "" : request.getCollectionName();
+        return recordLogicalOperation("Insert", collection,
+                () -> rpcUtils.retry(() -> vectorService.insert(this.getRpcStub(), request)));
+    }
+
+    /**
+     * Inserts new entities or updates existing ones depending on the primary key.
+     *
+     * <p>When the primary key already exists, the existing entity is deleted and replaced
+     * with the new data (override mode). When it does not exist, an insert is performed.
+     * Use {@link UpsertReq#isPartialUpdate()} for merge-mode partial field updates.</p>
+     *
+     * @param request the upsert request
+     * @return the upsert response containing the upserted count and primary keys
+     */
+
+
+    public UpsertResp upsert(UpsertReq request) {
+        String collection = request == null ? "" : request.getCollectionName();
+        return recordLogicalOperation("Upsert", collection,
+                () -> rpcUtils.retry(() -> vectorService.upsert(this.getRpcStub(), request)));
+    }
+
+    /**
+     * Deletes entities from a collection by filter expression or primary keys.
+     *
+     * @param request the delete request
+     * @return the delete response containing the number of deleted entities
+     */
+
+
+    public DeleteResp delete(DeleteReq request) {
+        String collection = request == null ? "" : request.getCollectionName();
+        return recordLogicalOperation("Delete", collection,
+                () -> rpcUtils.retry(() -> vectorService.delete(this.getRpcStub(), request)));
+    }
+
+    /**
+     * Retrieves entities by their primary keys.
+     *
+     * @param request the get request
+     * @return the get response containing the matching entities
+     */
+
+
+    public GetResp get(GetReq request) {
+        return get(request, null);
+    }
+
+    GetResp get(GetReq request, String clusterId) {
+        String collection = request == null ? "" : request.getCollectionName();
+        return recordLogicalOperation("Query", collection,
+                () -> rpcUtils.retry(() -> vectorService.get(this.getRpcStub(), request, clusterId)));
+    }
+
+    /**
+     * Retrieves entities by their primary keys asynchronously.
+     *
+     * @param request the get request
+     * @return a future completed with GetResp, or exceptionally when the operation fails
+     */
+
+
+    public CompletableFuture<GetResp> getAsync(GetReq request) {
+        return getAsync(request, null);
+    }
+
+    CompletableFuture<GetResp> getAsync(GetReq request, String clusterId) {
+        String clientRequestId = captureClientRequestId();
+        String collection = request == null ? "" : request.getCollectionName();
+        return recordLogicalOperationAsync("Query", collection,
+                () -> vectorService.getAsync(
+                        () -> getFutureRpcStub(clientRequestId), request, clusterId, rpcUtils));
+    }
+
+    /**
+     * Queries entities in a collection using a filter expression.
+     *
+     * @param request the query request
+     * @return the query response containing the matching entities
+     */
+
+
+    public QueryResp query(QueryReq request) {
+        return query(request, null);
+    }
+
+    QueryResp query(QueryReq request, String clusterId) {
+        String collection = request == null ? "" : request.getCollectionName();
+        return recordLogicalOperation("Query", collection,
+                () -> rpcUtils.retry(() -> vectorService.query(this.getRpcStub(), request, clusterId)));
+    }
+
+    /**
+     * Queries entities in a collection asynchronously using a filter expression.
+     *
+     * @param request the query request
+     * @return a future completed with QueryResp, or exceptionally when the operation fails
+     */
+
+
+    public CompletableFuture<QueryResp> queryAsync(QueryReq request) {
+        return queryAsync(request, null);
+    }
+
+    CompletableFuture<QueryResp> queryAsync(QueryReq request, String clusterId) {
+        String clientRequestId = captureClientRequestId();
+        String collection = request == null ? "" : request.getCollectionName();
+        return recordLogicalOperationAsync("Query", collection,
+                () -> vectorService.queryAsync(
+                        () -> getFutureRpcStub(clientRequestId), request, clusterId, rpcUtils));
+    }
+
+    /**
+     * Searches the top-k most similar entities to the given query vectors in a collection.
+     *
+     * <p>Use {@link SearchReq#getLimit()} to set top-K, {@link SearchReq#getFilter()} to narrow
+     * the search, and {@link SearchReq#getOutputFields()} to include additional entity fields
+     * in the results. Results are ordered by similarity score descending.</p>
+     *
+     * @param request the search request
+     * @return the search response, one result list per query vector
+     */
+
+
+    public SearchResp search(SearchReq request) {
+        return search(request, null);
+    }
+
+    SearchResp search(SearchReq request, String clusterId) {
+        String collection = request == null ? "" : request.getCollectionName();
+        return recordLogicalOperation("Search", collection,
+                () -> rpcUtils.retry(() -> vectorService.search(this.getRpcStub(), request, clusterId)));
+    }
+
+    /**
+     * Searches the top-k most similar entities asynchronously.
+     *
+     * @param request the search request
+     * @return a future completed with SearchResp, or exceptionally when the operation fails
+     */
+
+
+    public CompletableFuture<SearchResp> searchAsync(SearchReq request) {
+        return searchAsync(request, null);
+    }
+
+    CompletableFuture<SearchResp> searchAsync(SearchReq request, String clusterId) {
+        String clientRequestId = captureClientRequestId();
+        String collection = request == null ? "" : request.getCollectionName();
+        return recordLogicalOperationAsync("Search", collection,
+                () -> vectorService.searchAsync(
+                        () -> getFutureRpcStub(clientRequestId), request, clusterId, rpcUtils));
+    }
+
+    /**
+     * Runs a multi-vector similarity search and merges the results with a ranker.
+     *
+     * <p>Each sub-request in {@link HybridSearchReq#getSearchRequests()} searches a different
+     * vector field; the configured {@link HybridSearchReq#getRanker()} rearranges the combined
+     * results into a single ranked list.</p>
+     *
+     * @param request the hybrid search request
+     * @return the search response with the merged ranked results
+     */
+
+
+    public SearchResp hybridSearch(HybridSearchReq request) {
+        return hybridSearch(request, null);
+    }
+
+    SearchResp hybridSearch(HybridSearchReq request, String clusterId) {
+        String collection = request == null ? "" : request.getCollectionName();
+        return recordLogicalOperation("HybridSearch", collection,
+                () -> rpcUtils.retry(() -> vectorService.hybridSearch(this.getRpcStub(), request, clusterId)));
+    }
+
+    /**
+     * Runs a multi-vector similarity search with a ranker asynchronously.
+     *
+     * @param request the hybrid search request
+     * @return a future completed with SearchResp, or exceptionally when the operation fails
+     */
+
+
+    public CompletableFuture<SearchResp> hybridSearchAsync(HybridSearchReq request) {
+        return hybridSearchAsync(request, null);
+    }
+
+    CompletableFuture<SearchResp> hybridSearchAsync(HybridSearchReq request, String clusterId) {
+        String clientRequestId = captureClientRequestId();
+        String collection = request == null ? "" : request.getCollectionName();
+        return recordLogicalOperationAsync("HybridSearch", collection,
+                () -> vectorService.hybridSearchAsync(
+                        () -> getFutureRpcStub(clientRequestId), request, clusterId, rpcUtils));
+    }
+
+    /**
+     * Creates a paginated iterator over the entities matched by a scalar filter expression.
+     * Note that the order of the returned entities cannot be guaranteed.
+     *
+     * @param request the query iterator request
+     * @return a query iterator for stepping through the results in batches
+     */
+
+
+    public QueryIterator queryIterator(QueryIteratorReq request) {
+        return queryIterator(request, null);
+    }
+
+    QueryIterator queryIterator(QueryIteratorReq request, String clusterId) {
+        RpcStubWrapper stub = createIteratorRpcStub(request.getDatabaseName());
+        return rpcUtils.retry(() -> vectorService.queryIterator(stub, request, clusterId));
+    }
+
+    /**
+     * Creates a paginated iterator over a vector-field search, with an optional filter.
+     *
+     * @param request the search iterator request
+     * @return a search iterator for stepping through the results in batches
+     */
+
+
+    public SearchIterator searchIterator(SearchIteratorReq request) {
+        return searchIterator(request, null);
+    }
+
+    SearchIterator searchIterator(SearchIteratorReq request, String clusterId) {
+        RpcStubWrapper stub = createIteratorRpcStub(request.getDatabaseName());
+        return rpcUtils.retry(() -> vectorService.searchIterator(stub, request, clusterId));
+    }
+
+    /**
+     * Creates a paginated V2 search iterator over a vector field, with an optional filter.
+     *
+     * @param request the search iterator V2 request
+     * @return a search iterator V2 for stepping through the results in batches
+     */
+
+
+    public SearchIteratorV2 searchIteratorV2(SearchIteratorReqV2 request) {
+        return searchIteratorV2(request, null);
+    }
+
+    SearchIteratorV2 searchIteratorV2(SearchIteratorReqV2 request, String clusterId) {
+        RpcStubWrapper stub = createIteratorRpcStub(request.getDatabaseName());
+        return rpcUtils.retry(() -> vectorService.searchIteratorV2(stub, request, clusterId));
+    }
+
+    private RpcStubWrapper createIteratorRpcStub(String requestDatabaseName) {
+        String databaseName = StringUtils.isNotEmpty(requestDatabaseName)
+                ? requestDatabaseName : connectConfig.getDbName();
+        return new RpcStubWrapper(this.getRpcStub().withOption(
+                TelemetryInterceptor.LOGICAL_OPERATION_OPTION, true), connectConfig.getRpcDeadlineMs(),
+                cacheEndpoint, databaseName);
+    }
+
+    /**
+     * Run analyzer. Return result tokens of analysis.
+     * Milvus server supports this interface from v2.5.11
+     *
+     * @param request run analyzer request
+     * @return RunAnalyzerResp
+     */
+
+
+    public RunAnalyzerResp runAnalyzer(RunAnalyzerReq request) {
+        return recordLogicalOperation("RunAnalyzer", "",
+                () -> rpcUtils.retry(() -> vectorService.runAnalyzer(this.getRpcStub(), request)));
+    }
+
+    /////////////////////////////////////////////////////////////////////////////////////////////
+    // Partition Operations
+    /////////////////////////////////////////////////////////////////////////////////////////////
+    /**
+     * Creates a partition in a collection in Milvus.
+     *
+     * @param request create partition request
+     */
+
+    public void createPartition(CreatePartitionReq request) {
+        rpcUtils.retry(() -> partitionService.createPartition(this.getRpcStub(), request));
+    }
+
+    /**
+     * Drops a partition in a collection in Milvus.
+     *
+     * @param request drop partition request
+     */
+
+
+    public void dropPartition(DropPartitionReq request) {
+        rpcUtils.retry(() -> partitionService.dropPartition(this.getRpcStub(), request));
+    }
+
+    /**
+     * Checks whether a partition exists in a collection in Milvus.
+     *
+     * @param request has partition request
+     * @return Boolean
+     */
+
+
+    public Boolean hasPartition(HasPartitionReq request) {
+        return rpcUtils.retry(() -> partitionService.hasPartition(this.getRpcStub(), request));
+    }
+
+    /**
+     * Lists all partitions in a collection in Milvus.
+     *
+     * @param request list partitions request
+     * @return List of String partition names
+     */
+
+
+    public List<String> listPartitions(ListPartitionsReq request) {
+        return rpcUtils.retry(() -> partitionService.listPartitions(this.getRpcStub(), request));
+    }
+
+    /**
+     * Gets the statistics of a partition, such as its row count and data size.
+     *
+     * @param request the get partition stats request
+     * @return the partition statistics
+     */
+
+
+    public GetPartitionStatsResp getPartitionStats(GetPartitionStatsReq request) {
+        return rpcUtils.retry(() -> partitionService.getPartitionStats(this.getRpcStub(), request));
+    }
+
+    /**
+     * Loads partitions in a collection in Milvus.
+     *
+     * @param request load partitions request
+     */
+
+
+    public void loadPartitions(LoadPartitionsReq request) {
+        rpcUtils.retry(() -> partitionService.loadPartitions(this.getRpcStub(), request));
+    }
+
+    /**
+     * Releases partitions in a collection in Milvus.
+     *
+     * @param request release partitions request
+     */
+
+
+    public void releasePartitions(ReleasePartitionsReq request) {
+        rpcUtils.retry(() -> partitionService.releasePartitions(this.getRpcStub(), request));
+    }
+
+    /////////////////////////////////////////////////////////////////////////////////////////////
+    // RBAC Operations
+    /////////////////////////////////////////////////////////////////////////////////////////////
+    /**
+     * Lists all existing users in the current instance.
+     *
+     * @return the list of user names
+     */
+
+    public List<String> listUsers() {
+        return rpcUtils.retry(() -> rbacService.listUsers(this.getRpcStub()));
+    }
+
+    /**
+     * Shows the details of a user, including the roles granted to it.
+     *
+     * @param request the describe user request
+     * @return the user details including its granted roles
+     */
+
+
+    public DescribeUserResp describeUser(DescribeUserReq request) {
+        return rpcUtils.retry(() -> rbacService.describeUser(this.getRpcStub(), request));
+    }
+
+    /**
+     * Creates a user account with a password for authenticating to Milvus.
+     *
+     * <p>Permissions are managed by granting roles to the user. The built-in root user cannot
+     * be created again.</p>
+     *
+     * @param request the create user request
+     */
+
+
+    public void createUser(CreateUserReq request) {
+        rpcUtils.retry(() -> rbacService.createUser(this.getRpcStub(), request));
+    }
+
+    /**
+     * Changes the password of an existing user.
+     *
+     * <p>The new password must be 8-64 characters long and contain three of the following:
+     * uppercase letters, lowercase letters, numbers, and special characters. If the request
+     * enables {@code resetConnection}, the client reconnects with the new credentials.</p>
+     *
+     * @param request the update password request
+     */
+
+
+    public void updatePassword(UpdatePasswordReq request) {
+        rpcUtils.retry(() -> rbacService.updatePassword(this.getRpcStub(), request));
+        if (Boolean.TRUE.equals(request.getResetConnection()) && connectConfig != null) {
+            connectConfig.setUsername(request.getUserName());
+            connectConfig.setPassword(request.getNewPassword());
+            connectConfig.setToken(null);
+            connect(connectConfig);
+            initServices(connectConfig.getDbName());
+        }
+    }
+
+    /**
+     * Updates the description of an existing user.
+     *
+     * @param request the update user request
+     */
+
+
+    public void updateUser(UpdateUserReq request) {
+        rpcUtils.retry(() -> rbacService.updateUser(this.getRpcStub(), request));
+    }
+
+    /**
+     * Drops an existing user. The built-in root user cannot be dropped.
+     *
+     * @param request the drop user request
+     */
+
+
+    public void dropUser(DropUserReq request) {
+        rpcUtils.retry(() -> rbacService.dropUser(this.getRpcStub(), request));
+    }
+    // role operations
+
+    /**
+     * Lists all roles in the current instance.
+     *
+     * @return the list of role names
+     */
+
+
+    public List<String> listRoles() {
+        return rpcUtils.retry(() -> rbacService.listRoles(this.getRpcStub()));
+    }
+
+    /**
+     * Shows the details of a role, including all privileges granted to it.
+     *
+     * @param request the describe role request
+     * @return the role details including its granted privileges
+     */
+
+
+    public DescribeRoleResp describeRole(DescribeRoleReq request) {
+        return rpcUtils.retry(() -> rbacService.describeRole(this.getRpcStub(), request));
+    }
+
+    /**
+     * Creates a role to which privileges can be granted and which can then be assigned to users.
+     *
+     * <p>The built-in admin role already exists and cannot be created again.</p>
+     *
+     * @param request the create role request
+     */
+
+
+    public void createRole(CreateRoleReq request) {
+        rpcUtils.retry(() -> rbacService.createRole(this.getRpcStub(), request));
+    }
+
+    /**
+     * Updates the description of an existing role.
+     *
+     * @param request the alter role request
+     */
+
+
+    public void alterRole(AlterRoleReq request) {
+        rpcUtils.retry(() -> rbacService.alterRole(this.getRpcStub(), request));
+    }
+
+    /**
+     * Drops an existing role. The built-in admin role cannot be dropped.
+     *
+     * @param request the drop role request
+     */
+
+
+    public void dropRole(DropRoleReq request) {
+        rpcUtils.retry(() -> rbacService.dropRole(this.getRpcStub(), request));
+    }
+
+    /**
+     * Grants a privilege on a specified object (collection, database or instance) to a role.
+     *
+     * @param request the grant privilege request
+     */
+
+
+    public void grantPrivilege(GrantPrivilegeReq request) {
+        rpcUtils.retry(() -> rbacService.grantPrivilege(this.getRpcStub(), request));
+    }
+
+    /**
+     * Revokes a privilege on a specified object (collection, database or instance) from a role.
+     *
+     * @param request the revoke privilege request
+     */
+
+
+    public void revokePrivilege(RevokePrivilegeReq request) {
+        rpcUtils.retry(() -> rbacService.revokePrivilege(this.getRpcStub(), request));
+    }
+
+    /**
+     * Grants a role to a user, giving the user all the privileges of that role.
+     *
+     * @param request the grant role request
+     */
+
+
+    public void grantRole(GrantRoleReq request) {
+        rpcUtils.retry(() -> rbacService.grantRole(this.getRpcStub(), request));
+    }
+
+    /**
+     * Revokes a role from a user, removing the privileges of that role from the user.
+     *
+     * @param request the revoke role request
+     */
+
+
+    public void revokeRole(RevokeRoleReq request) {
+        rpcUtils.retry(() -> rbacService.revokeRole(this.getRpcStub(), request));
+    }
+
+    /**
+     * Creates a privilege group that bundles multiple privileges for easier role management.
+     *
+     * @param request the create privilege group request
+     */
+
+
+    public void createPrivilegeGroup(CreatePrivilegeGroupReq request) {
+        rpcUtils.retry(() -> rbacService.createPrivilegeGroup(this.getRpcStub(), request));
+    }
+
+    /**
+     * Drops a privilege group.
+     *
+     * @param request {@link DropPrivilegeGroupReq}
+     */
+
+
+    public void dropPrivilegeGroup(DropPrivilegeGroupReq request) {
+        rpcUtils.retry(() -> rbacService.dropPrivilegeGroup(this.getRpcStub(), request));
+    }
+
+    /**
+     * Lists all privilege groups.
+     *
+     * @param request {@link ListPrivilegeGroupsReq}
+     * @return {@link ListPrivilegeGroupsResp}
+     */
+
+
+    public ListPrivilegeGroupsResp listPrivilegeGroups(ListPrivilegeGroupsReq request) {
+        return rpcUtils.retry(() -> rbacService.listPrivilegeGroups(this.getRpcStub(), request));
+    }
+
+    /**
+     * Adds privileges to a privilege group.
+     *
+     * @param request {@link AddPrivilegesToGroupReq}
+     */
+
+
+    public void addPrivilegesToGroup(AddPrivilegesToGroupReq request) {
+        rpcUtils.retry(() -> rbacService.addPrivilegesToGroup(this.getRpcStub(), request));
+    }
+
+    /**
+     * Removes privileges from a privilege group.
+     *
+     * @param request {@link RemovePrivilegesFromGroupReq}
+     */
+
+
+    public void removePrivilegesFromGroup(RemovePrivilegesFromGroupReq request) {
+        rpcUtils.retry(() -> rbacService.removePrivilegesFromGroup(this.getRpcStub(), request));
+    }
+
+    /**
+     * Grants a privilege or a privilege group to a role.
+     *
+     * <p>The target resource is specified by database and collection names; use the wildcard
+     * {@code *} to cover all collections in a database, all databases, or the whole instance.</p>
+     *
+     * @param request the grant privilege v2 request
+     */
+
+
+    public void grantPrivilegeV2(GrantPrivilegeReqV2 request) {
+        rpcUtils.retry(() -> rbacService.grantPrivilegeV2(this.getRpcStub(), request));
+    }
+
+    /**
+     * Revokes a previously granted privilege or privilege group from a role.
+     *
+     * @param request the revoke privilege v2 request
+     */
+
+
+    public void revokePrivilegeV2(RevokePrivilegeReqV2 request) {
+        rpcUtils.retry(() -> rbacService.revokePrivilegeV2(this.getRpcStub(), request));
+    }
+
+    /////////////////////////////////////////////////////////////////////////////////////////////
+    // Row Level Security Operations
+    /////////////////////////////////////////////////////////////////////////////////////////////
+
+    /**
+     * Creates a row policy for the specified collection. An existing policy name is an error.
+     *
+     * <p>The policy type accepts permissive or restrictive, and the actions control which
+     * operations the policy applies to. The expressions are validated by Milvus.</p>
+     *
+     * @param request the create row policy request
+     */
+
+    public void createRowPolicy(CreateRowPolicyReq request) {
+        rpcUtils.retry(() -> rlsService.createRowPolicy(this.getRpcStub(), request));
+    }
+
+    /**
+     * Replaces the definition of the named policy, preserving its server-side identity.
+     *
+     * <p>The policy must exist. All definition fields replace their old values; omitted
+     * expressions and description become empty strings.</p>
+     *
+     * @param request the update row policy request
+     */
+
+    public void updateRowPolicy(UpdateRowPolicyReq request) {
+        rpcUtils.retry(() -> rlsService.updateRowPolicy(this.getRpcStub(), request));
+    }
+
+    /**
+     * Drops a row policy by name. Dropping a missing policy succeeds.
+     *
+     * @param request the drop row policy request
+     */
+
+    public void dropRowPolicy(DropRowPolicyReq request) {
+        rpcUtils.retry(() -> rlsService.dropRowPolicy(this.getRpcStub(), request));
+    }
+
+    /**
+     * Lists the row policies of the specified collection.
+     *
+     * @param request the list row policies request
+     * @return the row policy definitions
+     */
+
+    public ListRowPoliciesResp listRowPolicies(ListRowPoliciesReq request) {
+        return rpcUtils.retry(() -> rlsService.listRowPolicies(this.getRpcStub(), request));
+    }
+
+    /**
+     * Incrementally upserts a non-empty mapping of principal tags.
+     *
+     * <p>Values may be strings, finite numbers, or one-dimensional arrays of strings or
+     * numbers. Keys omitted from this call retain their values.</p>
+     *
+     * @param request the set RLS principal tags request
+     */
+
+    public void setRLSPrincipalTags(SetRLSPrincipalTagsReq request) {
+        rpcUtils.retry(() -> rlsService.setRLSPrincipalTags(this.getRpcStub(), request));
+    }
+
+    /**
+     * Returns the decoded tags of the specified principal.
+     *
+     * @param request the get RLS principal tags request
+     * @return the principal tags
+     */
+
+    public GetRLSPrincipalTagsResp getRLSPrincipalTags(GetRLSPrincipalTagsReq request) {
+        return rpcUtils.retry(() -> rlsService.getRLSPrincipalTags(this.getRpcStub(), request));
+    }
+
+    /**
+     * Lists the application principal names with stored tags in the specified collection.
+     *
+     * @param request the list RLS principals request
+     * @return the principal names
+     */
+
+    public ListRLSPrincipalsResp listRLSPrincipals(ListRLSPrincipalsReq request) {
+        return rpcUtils.retry(() -> rlsService.listRLSPrincipals(this.getRpcStub(), request));
+    }
+
+    /**
+     * Deletes the selected tag keys of a principal, or all tags when the tag key list is empty.
+     *
+     * @param request the delete RLS principal tags request
+     */
+
+    public void deleteRLSPrincipalTags(DeleteRLSPrincipalTagsReq request) {
+        rpcUtils.retry(() -> rlsService.deleteRLSPrincipalTags(this.getRpcStub(), request));
+    }
+
+    /////////////////////////////////////////////////////////////////////////////////////////////
+    // Resource group Operations
+    /////////////////////////////////////////////////////////////////////////////////////////////
+    /**
+     * Creates a resource group that physically isolates query nodes for collections loaded into it.
+     *
+     * <p>The group's capacity is described by a {@code ResourceGroupConfig} specifying requested
+     * and limited numbers of query nodes.</p>
+     *
+     * @param request the create resource group request
+     */
+
+    public void createResourceGroup(CreateResourceGroupReq request) {
+        rpcUtils.retry(() -> rgroupService.createResourceGroup(this.getRpcStub(), request));
+    }
+
+    /**
+     * Updates the configurations of multiple resource groups atomically.
+     *
+     * <p>Milvus adjusts the query node assignment as much as possible to satisfy the new
+     * configurations, and no intermediate state is visible during the update.</p>
+     *
+     * @param request the update resource groups request
+     */
+
+
+    public void updateResourceGroups(UpdateResourceGroupsReq request) {
+        rpcUtils.retry(() -> rgroupService.updateResourceGroups(this.getRpcStub(), request));
+    }
+
+    /**
+     * Drops a resource group.
+     *
+     * <p>Only a resource group holding no query nodes (with {@code limits.nodeNum} of zero)
+     * can be dropped.</p>
+     *
+     * @param request the drop resource group request
+     */
+
+
+    public void dropResourceGroup(DropResourceGroupReq request) {
+        rpcUtils.retry(() -> rgroupService.dropResourceGroup(this.getRpcStub(), request));
+    }
+
+    /**
+     * Lists all resource groups of the current instance.
+     *
+     * @param request the list resource groups request
+     * @return the resource groups response
+     */
+
+
+    public ListResourceGroupsResp listResourceGroups(ListResourceGroupsReq request) {
+        return rpcUtils.retry(() -> rgroupService.listResourceGroups(this.getRpcStub(), request));
+    }
+
+    /**
+     * Shows the details of a resource group, such as its capacity, configuration and nodes.
+     *
+     * @param request the describe resource group request
+     * @return the resource group details
+     */
+
+
+    public DescribeResourceGroupResp describeResourceGroup(DescribeResourceGroupReq request) {
+        return rpcUtils.retry(() -> rgroupService.describeResourceGroup(this.getRpcStub(), request));
+    }
+
+    /**
+     * Transfers a specified number of query nodes from a source resource group to a target
+     * resource group.
+     *
+     * @param request the transfer node request
+     */
+
+
+    public void transferNode(TransferNodeReq request) {
+        rpcUtils.retry(() -> rgroupService.transferNode(this.getRpcStub(), request));
+    }
+
+    /**
+     * Transfers a specified number of replicas of a collection from a source resource group to
+     * a target resource group.
+     *
+     * @param request the transfer replica request
+     */
+
+
+    public void transferReplica(TransferReplicaReq request) {
+        rpcUtils.retry(() -> rgroupService.transferReplica(this.getRpcStub(), request));
+    }
+
+    /////////////////////////////////////////////////////////////////////////////////////////////
+    // Snapshot Operations
+    /////////////////////////////////////////////////////////////////////////////////////////////
+    /**
+     * Creates a snapshot of the flushed data in a collection.
+     *
+     * <p>For a consistent snapshot, flush the collection first and avoid writing new data
+     * while the snapshot is being created.</p>
+     *
+     * @param request the create snapshot request
+     */
+
+    public void createSnapshot(CreateSnapshotReq request) {
+        rpcUtils.retry(() -> snapshotService.createSnapshot(this.getRpcStub(), request));
+    }
+
+    /**
+     * Drops a snapshot permanently, releasing the storage occupied by its data.
+     *
+     * @param request the drop snapshot request
+     */
+
+
+    public void dropSnapshot(DropSnapshotReq request) {
+        rpcUtils.retry(() -> snapshotService.dropSnapshot(this.getRpcStub(), request));
+    }
+
+    /**
+     * Lists the snapshots that already exist for a collection.
+     *
+     * @param request the list snapshots request
+     * @return the list of snapshot names
+     */
+
+
+    public ListSnapshotsResp listSnapshots(ListSnapshotsReq request) {
+        return rpcUtils.retry(() -> snapshotService.listSnapshots(this.getRpcStub(), request));
+    }
+
+    /**
+     * Gets the detailed information of a specific snapshot, such as its ID, creation time
+     * and description.
+     *
+     * @param request the describe snapshot request
+     * @return the snapshot details
+     */
+
+
+    public DescribeSnapshotResp describeSnapshot(DescribeSnapshotReq request) {
+        return rpcUtils.retry(() -> snapshotService.describeSnapshot(this.getRpcStub(), request));
+    }
+
+    /**
+     * Restores a snapshot into a new collection asynchronously.
+     *
+     * <p>The restoration copies the snapshot's segment files directly, so it is much faster
+     * than a conventional import-based restore.</p>
+     *
+     * @param request the restore snapshot request
+     * @return the restore response containing the job ID used to track progress
+     */
+
+
+    public RestoreSnapshotResp restoreSnapshot(RestoreSnapshotReq request) {
+        return rpcUtils.retry(() -> snapshotService.restoreSnapshot(this.getRpcStub(), request));
+    }
+
+    /**
+     * Gets the state and progress of a restore snapshot job identified by its job ID.
+     *
+     * <p>Use this method to poll an in-progress restoration until it completes or fails.</p>
+     *
+     * @param request the get restore snapshot state request
+     * @return the restore job state including progress, and a failure reason if any
+     */
+
+
+    public GetRestoreSnapshotStateResp getRestoreSnapshotState(GetRestoreSnapshotStateReq request) {
+        return rpcUtils.retry(() -> snapshotService.getRestoreSnapshotState(this.getRpcStub(), request));
+    }
+
+    /**
+     * Lists the snapshot restore jobs, optionally filtered by a target collection.
+     *
+     * @param request the list restore snapshot jobs request
+     * @return the list of restore jobs with their states and progress
+     */
+
+
+    public ListRestoreSnapshotJobsResp listRestoreSnapshotJobs(ListRestoreSnapshotJobsReq request) {
+        return rpcUtils.retry(() -> snapshotService.listRestoreSnapshotJobs(this.getRpcStub(), request));
+    }
+
+    /**
+     * Pins a snapshot's underlying data so that garbage collection does not delete it while
+     * the data is being copied out.
+     *
+     * <p>An optional TTL releases the pin automatically when it expires.</p>
+     *
+     * @param request the pin snapshot data request
+     * @return the pin response containing the pin ID needed to unpin later
+     */
+
+
+    public PinSnapshotDataResp pinSnapshotData(PinSnapshotDataReq request) {
+        return rpcUtils.retry(() -> snapshotService.pinSnapshotData(this.getRpcStub(), request));
+    }
+
+    /**
+     * Releases a pin previously created by {@link #pinSnapshotData(PinSnapshotDataReq)}.
+     *
+     * <p>Once unpinned, the snapshot data becomes eligible for garbage collection.</p>
+     *
+     * @param request the unpin snapshot data request containing the pin ID
+     */
+
+
+    public void unpinSnapshotData(UnpinSnapshotDataReq request) {
+        rpcUtils.retry(() -> snapshotService.unpinSnapshotData(this.getRpcStub(), request));
+    }
+
+    /////////////////////////////////////////////////////////////////////////////////////////////
+    // Utility Operations
+    /////////////////////////////////////////////////////////////////////////////////////////////
+    /**
+     * Creates an alias for a collection.
+     *
+     * <p>An alias is a mutable secondary name for a collection, allowing applications to switch
+     * between collections without changing code. A collection can have multiple aliases.</p>
+     *
+     * @param request the create alias request
+     */
+
+    public void createAlias(CreateAliasReq request) {
+        rpcUtils.retry(() -> utilityService.createAlias(this.getRpcStub(), request));
+    }
+
+    /**
+     * Drops an alias of a collection. The underlying collection and its data are unaffected.
+     *
+     * @param request the drop alias request
+     */
+
+
+    public void dropAlias(DropAliasReq request) {
+        rpcUtils.retry(() -> utilityService.dropAlias(this.getRpcStub(), request));
+    }
+
+    /**
+     * Reassigns an existing alias to another collection.
+     *
+     * @param request the alter alias request
+     */
+
+
+    public void alterAlias(AlterAliasReq request) {
+        rpcUtils.retry(() -> utilityService.alterAlias(this.getRpcStub(), request));
+    }
+
+    /**
+     * Lists all aliases of a collection.
+     *
+     * @param request the list aliases request
+     * @return the aliases response containing the alias names
+     */
+
+
+    public ListAliasResp listAliases(ListAliasesReq request) {
+        return rpcUtils.retry(() -> utilityService.listAliases(this.getRpcStub(), request));
+    }
+
+    /**
+     * Shows the details of an alias, including the collection it points to.
+     *
+     * @param request the describe alias request
+     * @return the alias details
+     */
+
+
+    public DescribeAliasResp describeAlias(DescribeAliasReq request) {
+        return rpcUtils.retry(() -> utilityService.describeAlias(this.getRpcStub(), request));
+    }
+
+    /**
+     * Flushes buffered inserts of the target collections to persistent storage.
+     *
+     * <p>When {@code waitFlushedTimeoutMs} is positive, this call blocks until the flush has
+     * completed (all data uploaded), which is recommended before creating a snapshot.</p>
+     *
+     * @param request the flush request
+     */
+
+
+    public void flush(FlushReq request) {
+        FlushResp response = rpcUtils.retry(() -> utilityService.flush(this.getRpcStub(), request));
+
+        // The BlockingStub.flush() api returns immediately after the datanode set all growing segments to be "sealed".
+        // The flush state becomes "Completed" after the datanode uploading them to S3 asynchronously.
+        // Here we wait the flush action to be "Completed".
+        MilvusServiceGrpc.MilvusServiceBlockingStub tempBlockingStub =
+                MilvusServiceGrpc.newBlockingStub(channel).withWaitForReady();
+        if (request.getWaitFlushedTimeoutMs() > 0L) {
+            tempBlockingStub = tempBlockingStub.withDeadlineAfter(request.getWaitFlushedTimeoutMs(), TimeUnit.MILLISECONDS);
+        }
+        utilityService.waitFlush(tempBlockingStub, response);
+    }
+
+    /**
+     * Flushes the buffered inserts of all collections in the current database to persistent
+     * storage.
+     *
+     * <p>When {@code waitFlushedTimeoutMs} is positive, this call blocks until the flush has
+     * completed.</p>
+     *
+     * @param request the flush all request
+     * @return the flush all response with the flush-all timestamp to query its state
+     */
+
+
+    public FlushAllResp flushAll(FlushAllReq request) {
+        FlushAllResp response = rpcUtils.retry(() -> utilityService.flushAll(this.getRpcStub(), request));
+
+        MilvusServiceGrpc.MilvusServiceBlockingStub tempBlockingStub =
+                MilvusServiceGrpc.newBlockingStub(channel).withWaitForReady();
+        if (request.getWaitFlushedTimeoutMs() > 0L) {
+            tempBlockingStub = tempBlockingStub.withDeadlineAfter(request.getWaitFlushedTimeoutMs(), TimeUnit.MILLISECONDS);
+        }
+        utilityService.waitFlushAll(tempBlockingStub, response, request);
+        return response;
+    }
+
+    /**
+     * Gets the flush-all state of a collection, indicating whether the flush-all operation
+     * has fully persisted the data.
+     *
+     * @param request the get flush all state request
+     * @return the flush-all state response
+     */
+
+
+    public GetFlushAllStateResp getFlushAllState(GetFlushAllStateReq request) {
+        return rpcUtils.retry(() -> utilityService.getFlushAllState(this.getRpcStub(), request));
+    }
+
+    /**
+     * Gets the information of persistent segments from data node, including row count,
+     * persistence state(growing or flushed), etc.
+     *
+     * @param request the persistent segment info request
+     * @return GetPersistentSegmentInfoResp
+     */
+
+
+    public GetPersistentSegmentInfoResp getPersistentSegmentInfo(GetPersistentSegmentInfoReq request) {
+        return rpcUtils.retry(() -> utilityService.getPersistentSegmentInfo(this.getRpcStub(), request));
+    }
+
+    /**
+     * Gets the query information of segments in a collection from query node, including row count,
+     * memory usage size, index name, etc.
+     *
+     * @param request the query segment info request
+     * @return GetQuerySegmentInfoResp
+     */
+
+
+    public GetQuerySegmentInfoResp getQuerySegmentInfo(GetQuerySegmentInfoReq request) {
+        return rpcUtils.retry(() -> utilityService.getQuerySegmentInfo(this.getRpcStub(), request));
+    }
+
+    /**
+     * Triggers an asynchronous compaction that merges small segments and cleans up deleted
+     * data in a collection.
+     *
+     * <p>Clustering compaction ({@code isClustering}) additionally redistributes entities
+     * among segments by the clustering key to speed up filtered searches.</p>
+     *
+     * @param request the compact request
+     * @return the compaction ID of the triggered compaction task
+     */
+
+
+    public CompactResp compact(CompactReq request) {
+        return rpcUtils.retry(() -> utilityService.compact(this.getRpcStub(), request));
+    }
+
+    /**
+     * Gets the state of a compaction task by its compaction ID, such as executing, completed
+     * or failed.
+     *
+     * @param request the get compaction state request
+     * @return the compaction state response
+     */
+
+
+    public GetCompactionStateResp getCompactionState(GetCompactionStateReq request) {
+        return rpcUtils.retry(() -> utilityService.getCompactionState(this.getRpcStub(), request));
+    }
+
+    /**
+     * Gets the segment merge plans of a compaction task by its compaction ID.
+     *
+     * @param request the get compaction plans request
+     * @return the compaction plans response
+     */
+
+
+    public GetCompactionPlansResp getCompactionPlans(GetCompactionPlansReq request) {
+        return rpcUtils.retry(() -> utilityService.getCompactionPlans(this.getRpcStub(), request));
+    }
+
+    /**
+     * Lists all compaction tasks still retained for a collection, whether automatically
+     * or manually triggered.
+     *
+     * <p>Terminal tasks are subject to server-side garbage collection and are not an audit log.</p>
+     *
+     * @param request the list compaction tasks request
+     * @return the compaction plans response
+     */
+
+
+    public GetCompactionPlansResp listCompactionTasks(ListCompactionTasksReq request) {
+        return rpcUtils.retry(() -> utilityService.listCompactionTasks(this.getRpcStub(), request));
+    }
+
+    /**
+     * Refreshes an external collection by scanning its external data source and regenerating
+     * the manifest files that map Milvus metadata to rows in the external files.
+     *
+     * <p>The refresh is asynchronous; poll its progress with
+     * {@link #getRefreshExternalCollectionProgress(GetRefreshExternalCollectionProgressReq)}.</p>
+     *
+     * @param request the refresh external collection request
+     * @return the refresh response containing the job ID
+     */
+
+
+    public RefreshExternalCollectionResp refreshExternalCollection(RefreshExternalCollectionReq request) {
+        return rpcUtils.retry(() -> utilityService.refreshExternalCollection(this.getRpcStub(), request));
+    }
+
+    /**
+     * Gets the progress of a refresh external collection job identified by its job ID.
+     *
+     * @param request the get refresh progress request containing the job ID
+     * @return the job info with state, progress and elapsed time
+     */
+
+
+    public GetRefreshExternalCollectionProgressResp getRefreshExternalCollectionProgress(GetRefreshExternalCollectionProgressReq request) {
+        return rpcUtils.retry(() -> utilityService.getRefreshExternalCollectionProgress(this.getRpcStub(), request));
+    }
+
+    /**
+     * Lists the refresh external collection jobs, optionally filtered by a collection.
+     *
+     * @param request the list refresh jobs request
+     * @return the list of refresh job infos
+     */
+
+
+    public ListRefreshExternalCollectionJobsResp listRefreshExternalCollectionJobs(ListRefreshExternalCollectionJobsReq request) {
+        return rpcUtils.retry(() -> utilityService.listRefreshExternalCollectionJobs(this.getRpcStub(), request));
+    }
+
+    /**
+     * Registers an external dictionary file stored in the configured object store as a file
+     * resource that text analyzers can reference by name.
+     *
+     * <p>The call validates synchronously that the file exists at the given path and is
+     * idempotent for the same name and path.</p>
+     *
+     * @param request the add file resource request containing name and path
+     */
+
+
+    public void addFileResource(AddFileResourceReq request) {
+        rpcUtils.retry(() -> utilityService.addFileResource(this.getRpcStub(), request));
+    }
+
+    /**
+     * Removes a registered file resource by name.
+     *
+     * <p>The operation is idempotent: removing a name that does not exist is not an error.
+     * Drop or alter collections that still reference the resource first.</p>
+     *
+     * @param request the remove file resource request containing name
+     */
+
+
+    public void removeFileResource(RemoveFileResourceReq request) {
+        rpcUtils.retry(() -> utilityService.removeFileResource(this.getRpcStub(), request));
+    }
+
+    /**
+     * Lists all registered file resources with their names and paths.
+     *
+     * @param request the list file resources request
+     * @return the list of file resources
+     */
+
+
+    public ListFileResourcesResp listFileResources(ListFileResourcesReq request) {
+        return rpcUtils.retry(() -> utilityService.listFileResources(this.getRpcStub(), request));
+    }
+
+    /**
+     * Dump messages from a WAL range for data salvage.
+     *
+     * @param request dump messages request
+     * @return DumpMessagesResp containing a lazy stream of dumped messages
+     */
+
+
+    public DumpMessagesResp dumpMessages(DumpMessagesReq request) {
+        return cdcService.dumpMessages(this.getRpcStub(), request);
+    }
+
+    /**
+     * Optimize collection to adjust segment sizes for better query performance.
+     *
+     * This method performs the following operations:
+     * 1. Waits for all indexes to complete building
+     * 2. Triggers force merge compaction with optional target size
+     * 3. Waits for compaction to complete
+     * 4. Waits for index rebuild to complete
+     * 5. Refreshes collection load if collection is loaded
+     *
+     * @param request the optimize request
+     * @return OptimizeTask for tracking progress and getting result
+     */
+
+
+    public OptimizeTask optimize(OptimizeReq request) {
+        OptimizeTask task = new OptimizeTask(
+                request.getCollectionName(),
+                request.getDatabaseName(),
+                request.getTargetSize(),
+                request.getTimeout(),
+                this::executeOptimize
+        );
+        task.start();
+
+        if (!request.isAsync()) {
+            task.getResult(request.getTimeout());
+        }
+
+        return task;
+    }
+
+    private OptimizeResp executeOptimize(OptimizeTask task, String collectionName,
+                                         String databaseName, Long sizeMb, Long timeout) {
+        long startMs = System.currentTimeMillis();
+
+        task.checkCancelled();
+        List<String> vectorIndexNames = listVectorIndexes(collectionName, databaseName);
+
+        task.checkCancelled();
+        task.setProgress(OptimizeTask.ProgressStage.WAITING_FOR_INDEXES);
+        waitForIndexes(task, collectionName, databaseName, vectorIndexNames, startMs, timeout);
+
+        task.checkCancelled();
+        task.setProgress(OptimizeTask.ProgressStage.COMPACTING);
+        CompactReq.CompactReqBuilder compactBuilder = CompactReq.builder()
+                .collectionName(collectionName);
+        if (databaseName != null) {
+            compactBuilder.databaseName(databaseName);
+        }
+        if (sizeMb != null) {
+            compactBuilder.targetSize(sizeMb);
+        }
+        CompactResp compactResp = compact(compactBuilder.build());
+        long compactionId = compactResp.getCompactionID();
+
+        task.checkCancelled();
+        task.setProgress(OptimizeTask.ProgressStage.WAITING_FOR_COMPACTION);
+        waitForCompaction(task, compactionId, startMs, timeout);
+
+        task.checkCancelled();
+        task.setProgress(OptimizeTask.ProgressStage.WAITING_FOR_INDEX_REBUILD);
+        waitForIndexes(task, collectionName, databaseName, vectorIndexNames, startMs, timeout);
+
+        task.checkCancelled();
+        GetLoadStateReq.GetLoadStateReqBuilder loadStateBuilder = GetLoadStateReq.builder()
+                .collectionName(collectionName);
+        if (databaseName != null) {
+            loadStateBuilder.databaseName(databaseName);
+        }
+        Boolean loaded = getLoadState(loadStateBuilder.build());
+        if (Boolean.TRUE.equals(loaded)) {
+            task.setProgress(OptimizeTask.ProgressStage.REFRESHING_LOAD);
+            RefreshLoadReq.RefreshLoadReqBuilder refreshBuilder = RefreshLoadReq.builder()
+                    .collectionName(collectionName);
+            if (databaseName != null) {
+                refreshBuilder.databaseName(databaseName);
+            }
+            refreshLoad(refreshBuilder.build());
+        }
+
+        return OptimizeResp.builder()
+                .status("success")
+                .collectionName(collectionName)
+                .compactionId(compactionId)
+                .targetSize(sizeMb != null ? sizeMb + "MB" : null)
+                .progress(task.getProgressHistoryAsStrings())
+                .build();
+    }
+
+    private List<String> listVectorIndexes(String collectionName, String databaseName) {
+        DescribeCollectionReq.DescribeCollectionReqBuilder descBuilder = DescribeCollectionReq.builder()
+                .collectionName(collectionName);
+        if (databaseName != null) {
+            descBuilder.databaseName(databaseName);
+        }
+        DescribeCollectionResp collResp = describeCollection(descBuilder.build());
+        List<String> vectorFieldNames = collResp.getVectorFieldNames();
+
+        if (vectorFieldNames == null || vectorFieldNames.isEmpty()) {
+            return new ArrayList<>();
+        }
+
+        ListIndexesReq.ListIndexesReqBuilder listBuilder = ListIndexesReq.builder()
+                .collectionName(collectionName);
+        if (databaseName != null) {
+            listBuilder.databaseName(databaseName);
+        }
+        List<String> allIndexes = listIndexes(listBuilder.build());
+
+        List<String> vectorIndexes = new ArrayList<>();
+        for (String indexName : allIndexes) {
+            DescribeIndexReq.DescribeIndexReqBuilder idxBuilder = DescribeIndexReq.builder()
+                    .collectionName(collectionName)
+                    .indexName(indexName);
+            if (databaseName != null) {
+                idxBuilder.databaseName(databaseName);
+            }
+            DescribeIndexResp indexResp = describeIndex(idxBuilder.build());
+            DescribeIndexResp.IndexDesc desc = indexResp.getIndexDescByIndexName(indexName);
+            if (desc != null && vectorFieldNames.contains(desc.getFieldName())) {
+                vectorIndexes.add(indexName);
+            }
+        }
+
+        return vectorIndexes;
+    }
+
+    private void waitForIndexes(OptimizeTask task, String collectionName, String databaseName,
+                                List<String> indexNames, long startMs, Long timeout) {
+        if (indexNames == null || indexNames.isEmpty()) {
+            return;
+        }
+
+        for (String indexName : indexNames) {
+            task.checkCancelled();
+
+            while (true) {
+                task.checkCancelled();
+                checkTimeout(startMs, timeout, "Timeout waiting for indexes to complete on collection " + collectionName);
+
+                DescribeIndexReq.DescribeIndexReqBuilder builder = DescribeIndexReq.builder()
+                        .collectionName(collectionName)
+                        .indexName(indexName);
+                if (databaseName != null) {
+                    builder.databaseName(databaseName);
+                }
+                DescribeIndexResp indexResp = describeIndex(builder.build());
+                DescribeIndexResp.IndexDesc desc = indexResp.getIndexDescByIndexName(indexName);
+
+                if (desc != null && desc.getIndexState() == IndexBuildState.Finished) {
+                    break;
+                }
+                if (desc != null && desc.getIndexState() == IndexBuildState.Failed) {
+                    throw new MilvusClientException(ErrorCode.SERVER_ERROR,
+                            "Index build failed for '" + indexName + "': " + desc.getIndexFailedReason());
+                }
+
+                try {
+                    Thread.sleep(500);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new MilvusClientException(ErrorCode.CLIENT_ERROR, "Interrupted while waiting for indexes");
+                }
+            }
+        }
+    }
+
+    private void waitForCompaction(OptimizeTask task, long compactionId, long startMs, Long timeout) {
+        while (true) {
+            task.checkCancelled();
+            checkTimeout(startMs, timeout, "Timeout waiting for compaction " + compactionId + " to complete");
+
+            GetCompactionStateResp state = getCompactionState(
+                    GetCompactionStateReq.builder().compactionID(compactionId).build());
+
+            if (state.getState() == CompactionState.Completed) {
+                break;
+            }
+
+            try {
+                Thread.sleep(500);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new MilvusClientException(ErrorCode.CLIENT_ERROR, "Interrupted while waiting for compaction");
+            }
+        }
+    }
+
+    private void checkTimeout(long startMs, Long timeout, String message) {
+        if (timeout != null) {
+            long elapsed = System.currentTimeMillis() - startMs;
+            if (elapsed >= timeout) {
+                throw new MilvusClientException(ErrorCode.CLIENT_ERROR, message);
+            }
+        }
+    }
+
+    /**
+     * Gets the version of the Milvus server this client is connected to.
+     *
+     * @return the server version string
+     */
+
+
+    public String getServerVersion() {
+        return rpcUtils.retry(() -> utilityService.getServerVersion(this.getRpcStub(),
+                GetServerVersionReq.builder().build()).getVersion());
+    }
+
+    /**
+     * Gets the version information of the Milvus server this client is connected to.
+     *
+     * @param request the get server version request
+     * @return the server version details
+     */
+
+
+    public GetServerVersionResp getServerVersionV2(GetServerVersionReq request) {
+        return rpcUtils.retry(() -> utilityService.getServerVersion(this.getRpcStub(), request));
+    }
+
+    /**
+     * Checks the health of the connected Milvus server, including whether it is reachable
+     * and any reported error information.
+     *
+     * @return the health check response
+     */
+
+
+    public CheckHealthResp checkHealth() {
+        return rpcUtils.retry(() -> utilityService.checkHealth(this.getRpcStub()));
+    }
+
+    /**
+     * Gets the replication info of the connected cluster.
+     *
+     * @param request {@link GetReplicateInfoReq}
+     * @return {@link GetReplicateInfoResp}
+     */
+
+
+    public GetReplicateInfoResp getReplicateInfo(GetReplicateInfoReq request) {
+        return rpcUtils.retry(() -> cdcService.getReplicateInfo(this.getRpcStub(), request));
+    }
+
+    /**
+     * Gets the replication configuration of the connected cluster.
+     *
+     * @return {@link GetReplicateConfigurationResp}
+     */
+
+
+    public GetReplicateConfigurationResp getReplicateConfiguration() {
+        return rpcUtils.retry(() -> cdcService.getReplicateConfiguration(this.getRpcStub()));
+    }
+
+    /**
+     * Updates the replication configuration of the connected cluster.
+     *
+     * @param request {@link UpdateReplicateConfigurationReq}
+     * @return {@link UpdateReplicateConfigurationResp}
+     */
+
+
+    public UpdateReplicateConfigurationResp updateReplicateConfiguration(UpdateReplicateConfigurationReq request) {
+        return rpcUtils.retry(() -> cdcService.updateReplicateConfiguration(this.getRpcStub(), request));
+    }
+
+    /**
+     * Disconnects from a Milvus server with configurable timeout
+     *
+     * @param maxWaitSeconds max wait seconds
+     * @throws InterruptedException throws InterruptedException if the client failed to close connection
+     */
+
+
+    public void close(long maxWaitSeconds) throws InterruptedException {
+        // cancel any pending async retries and release the per-client retry scheduler
+        rpcUtils.shutdown();
+        if (globalStub != null) {
+            globalStub.close();
+            globalStub = null;
+            // channel is owned by the inner client, already closed by globalStub.close()
+            channel = null;
+            blockingStub = null;
+            futureStub = null;
+            telemetry = null;
+            return;
+        }
+        if (telemetry != null) {
+            telemetry.close();
+            telemetry = null;
+        }
+        if (channel != null) {
+            channel.shutdownNow();
+            channel.awaitTermination(maxWaitSeconds, TimeUnit.SECONDS);
+        }
+        // the stub on the closed channel is no longer usable; drop it so calls
+        // issued after close fail fast instead of retrying the closed channel
+        blockingStub = null;
+        futureStub = null;
+    }
+
+    /**
+     * Disconnects from a Milvus server with timeout of 1 minute
+     *
+     */
+
+
+    public void close() {
+        try {
+            close(TimeUnit.MINUTES.toSeconds(1));
+        } catch (InterruptedException e) {
+            logger.error("Interrupted during shutdown Milvus client!");
+        }
+    }
+
+    /**
+     * Checks whether the client connection to the Milvus server is ready.
+     *
+     * @return true if the underlying channel is open and usable
+     */
+
+
+    public boolean clientIsReady() {
+        if (globalStub != null) {
+            MilvusClientV2 primaryClient = globalStub.getPrimaryClient();
+            return primaryClient != null && primaryClient.clientIsReady();
+        }
+        return channel != null && !channel.isShutdown() && !channel.isTerminated();
+    }
+}

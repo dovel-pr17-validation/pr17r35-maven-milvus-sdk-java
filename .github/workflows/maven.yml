@@ -1,0 +1,105 @@
+# This workflow will build a Java project with Maven, and cache/restore any dependencies to improve the workflow execution time
+# For more information see: https://help.github.com/actions/language-and-framework-guides/building-and-testing-java-with-maven
+
+name: Java CI with Maven
+
+on:
+  pull_request:
+    paths-ignore:
+      - '**/*.md'
+      - 'doc/**'
+      - 'benchmark/**'
+      - '**/OWNERS'
+      - 'LICENSE'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  ubuntu:
+    name: Build and test on ubuntu
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup JDK 11
+        uses: actions/setup-java@v4
+        with:
+          java-version: '11'
+          distribution: 'adopt'
+          cache: maven
+      - name: Update submodule
+        run: git submodule update --init
+      # sdk-bulkwriter depends on milvus-sdk-java:${revision}. The version under development is
+      # not on Maven Central yet, so build and install sdk-core into the local repository first
+      # to let the module-only build below resolve it.
+      - name: Install sdk-core
+        run: mvn -pl sdk-core install "-Dmaven.test.skip=true" --batch-mode
+      # BulkWriter must be tested on linux: several unit tests write Parquet files locally and
+      # require Hadoop's native WinUtils, which is only bundled for linux. On windows these tests
+      # fail with "HADOOP_HOME and hadoop.home.dir are unset" (see PR #2075), so keep this step on
+      # the ubuntu job.
+      - name: BulkWriter unit tests (ut)
+        run: mvn -pl sdk-bulkwriter -Pcoverage "-Djacoco.destFile=target/jacoco-ut-bulk.exec" "-Djacoco.reportDir=target/site/jacoco-ut-bulk" --batch-mode --update-snapshots verify
+      # The examples project depends on milvus-sdk-java-bulkwriter from the local repository,
+      # and the bulkwriter verify step above does not install the artifact. Install it (without
+      # re-running its unit tests) so the examples can compile against the version under
+      # development; the examples module is not part of the Maven reactor, so this explicit step
+      # is the only check that new examples stay compilable.
+      - name: Install sdk-bulkwriter
+        run: mvn -pl sdk-bulkwriter install "-Dmaven.test.skip=true" --batch-mode
+      - name: Examples compile
+        run: mvn -f examples/pom.xml compile --batch-mode
+      - name: System tests (st)
+        run: mvn -Pcoverage -Psystem "-Dtest.groups=system" "-Djacoco.destFile=target/jacoco-st.exec" "-Djacoco.reportDir=target/site/jacoco-st" --batch-mode --update-snapshots verify
+      # The Spring Boot starter requires Java 17 and is only part of the reactor on JDK 17+, so
+      # switch JDKs for this step. It resolves sdk-core from the local repository installed above.
+      - name: Setup JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'adopt'
+          cache: maven
+      - name: Spring Boot starter unit tests (ut)
+        run: mvn -pl sdk-spring-boot-starter --batch-mode verify
+      - name: Upload coverage
+        uses: codecov/codecov-action@v5
+        with:
+          files: ./sdk-core/target/site/jacoco-st/jacoco.xml,./sdk-bulkwriter/target/site/jacoco-ut-bulk/jacoco.xml
+          name: ubuntu-jacoco-coverage
+          disable_safe_directory: true
+          verbose: true
+
+  windows:
+    name: Build and test on windows
+    runs-on: windows-2022
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup JDK 11
+        uses: actions/setup-java@v4
+        with:
+          java-version: '11'
+          distribution: 'adopt'
+          cache: maven
+      - name: Update submodule
+        run: git submodule update --init
+      # The tutorials consume milvus-sdk-java:${milvus.sdk.version} from the local repository when
+      # it is present (falling back to Maven Central). Install sdk-core first so the tutorials can
+      # compile against the version under development before it is published.
+      - name: Install sdk-core
+        run: mvn -pl sdk-core install "-Dmaven.test.skip=true" --batch-mode
+      - name: Tutorials compile
+        run: mvn -f tutorial/pom.xml compile --batch-mode
+      - name: Unit tests (ut)
+        run: mvn -pl sdk-core -Pcoverage "-Djacoco.destFile=target/jacoco-ut.exec" "-Djacoco.reportDir=target/site/jacoco-ut" --batch-mode --update-snapshots verify
+      - name: Integration tests (it)
+        run: mvn -pl sdk-core -Pcoverage -Pintegration "-Dtest.groups=integration" "-Djacoco.destFile=target/jacoco-it.exec" "-Djacoco.reportDir=target/site/jacoco-it" --batch-mode --update-snapshots verify
+      - name: Upload coverage
+        uses: codecov/codecov-action@v5
+        with:
+          files: ./sdk-core/target/site/jacoco-ut/jacoco.xml,./sdk-core/target/site/jacoco-it/jacoco.xml
+          name: windows-jacoco-coverage
+          disable_safe_directory: true
+          verbose: true

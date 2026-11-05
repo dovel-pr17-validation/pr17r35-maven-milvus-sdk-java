@@ -1,0 +1,132 @@
+package io.milvus.v2.service.vector.request.data;
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+
+import io.milvus.grpc.PlaceholderType;
+import io.milvus.v2.exception.ErrorCode;
+import io.milvus.v2.exception.MilvusClientException;
+
+import java.nio.ByteBuffer;
+import java.util.ArrayList;
+import java.util.List;
+
+/**
+ * A collection of vectors that is mainly used for searching vectors stored in a struct
+ * field. All vectors in the list must share the same vector type.
+ */
+
+
+public class EmbeddingList implements BaseVector {
+    private List<BaseVector> data = new ArrayList<>();
+
+    /**
+     * Adds a vector to the embedding list.
+     *
+     * @param vector the vector to add
+     * @throws MilvusClientException if the vector type differs from the type of the
+     *                               vectors already in the list
+     */
+
+
+    public void add(BaseVector vector) {
+        if (!data.isEmpty() && data.get(0).getPlaceholderType() != vector.getPlaceholderType()) {
+            throw new MilvusClientException(ErrorCode.INVALID_PARAMS, "Not allow to add different types of vector");
+        }
+        data.add(vector);
+    }
+
+    /**
+     * Returns the placeholder type of the embedded vector list, derived from the type of
+     * the contained vectors.
+     *
+     * @return the placeholder type, or {@link PlaceholderType#None} if the list is empty
+     * @throws MilvusClientException if the contained vector type is not supported
+     */
+    @Override
+    public PlaceholderType getPlaceholderType() {
+        if (data.isEmpty()) {
+            return PlaceholderType.None;
+        }
+        PlaceholderType pt = data.get(0).getPlaceholderType();
+        switch (pt) {
+            case FloatVector:
+                return PlaceholderType.EmbListFloatVector;
+            case BinaryVector:
+                return PlaceholderType.EmbListBinaryVector;
+            case Float16Vector:
+                return PlaceholderType.EmbListFloat16Vector;
+            case BFloat16Vector:
+                return PlaceholderType.EmbListBFloat16Vector;
+            case SparseFloatVector:
+                return PlaceholderType.EmbListSparseFloatVector;
+            case Int8Vector:
+                return PlaceholderType.EmbListInt8Vector;
+            default:
+                throw new MilvusClientException(ErrorCode.INVALID_PARAMS, "Unsupported vector type: " + pt.name());
+        }
+    }
+
+    /**
+     * Returns the vectors of the list flattened into a single object, either as a list of
+     * float values for float vectors or as a merged {@link ByteBuffer} for binary, float16,
+     * bfloat16, and int8 vectors.
+     *
+     * @return the flattened vector data
+     * @throws MilvusClientException if the list is empty or the contained vector type is
+     *                               not supported
+     */
+    @Override
+    public Object getData() {
+        if (data.isEmpty()) {
+            throw new MilvusClientException(ErrorCode.INVALID_PARAMS, "EmbeddingList is empty");
+        }
+
+        // return the vectors as flatten
+        PlaceholderType pt = data.get(0).getPlaceholderType();
+        switch (pt) {
+            case FloatVector:
+                List<Object> floats = new ArrayList<>();
+                for (BaseVector vec : data) {
+                    floats.addAll((List<Object>) vec.getData());
+                }
+                return floats;
+            case BinaryVector:
+            case Float16Vector:
+            case BFloat16Vector:
+            case Int8Vector:
+                int totalBytes = 0;
+                List<ByteBuffer> buffers = new ArrayList<>();
+                for (BaseVector vec : data) {
+                    ByteBuffer buf = ((ByteBuffer) vec.getData()).asReadOnlyBuffer();
+                    totalBytes += buf.limit();
+                    buffers.add(buf);
+                }
+                ByteBuffer merged = ByteBuffer.allocate(totalBytes);
+                for (ByteBuffer buf : buffers) {
+                    ByteBuffer copy = buf.asReadOnlyBuffer();
+                    copy.position(0);
+                    merged.put(copy);
+                }
+                return merged;
+            default:
+                throw new MilvusClientException(ErrorCode.INVALID_PARAMS, "Unsupported vector type: " + pt.name());
+        }
+    }
+}

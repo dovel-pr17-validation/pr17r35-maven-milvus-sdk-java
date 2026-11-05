@@ -1,0 +1,106 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+package io.milvus.v2.service.utility.response;
+
+/**
+ * Response returned by the {@code flushAll} API.
+ */
+
+
+public class FlushAllResp {
+    private Long flushAllTs;
+
+    private FlushAllResp(FlushAllRespBuilder builder) {
+        this.flushAllTs = builder.flushAllTs;
+    }
+
+    /**
+     * Creates a new builder for {@code FlushAllResp}.
+     *
+     * @return the builder
+     */
+
+
+    public static FlushAllRespBuilder builder() {
+        return new FlushAllRespBuilder();
+    }
+
+    /**
+     * Returns the flush-all timestamp.
+     *
+     * @return the flush-all timestamp
+     */
+
+
+    public Long getFlushAllTs() {
+        return flushAllTs;
+    }
+
+    /**
+     * Sets the flush-all timestamp.
+     *
+     * @param flushAllTs the flush-all timestamp
+     */
+
+
+    public void setFlushAllTs(Long flushAllTs) {
+        this.flushAllTs = flushAllTs;
+    }
+
+    @Override
+    public String toString() {
+        return "FlushAllResp{" +
+                "flushAllTs=" + flushAllTs +
+                '}';
+    }
+
+    /**
+     * Builder for {@link FlushAllResp} class.
+     */
+
+
+    public static class FlushAllRespBuilder {
+        private Long flushAllTs = 0L;
+
+        /**
+         * Sets the flush-all timestamp.
+         *
+         * @param flushAllTs the flush-all timestamp
+         * @return this builder
+         */
+
+
+        public FlushAllRespBuilder flushAllTs(Long flushAllTs) {
+            this.flushAllTs = flushAllTs;
+            return this;
+        }
+
+        /**
+         * Builds the {@code FlushAllResp}.
+         *
+         * @return the constructed {@code FlushAllResp}
+         */
+
+
+        public FlushAllResp build() {
+            return new FlushAllResp(this);
+        }
+    }
+}

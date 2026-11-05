@@ -1,0 +1,152 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+package io.milvus.response;
+
+import com.google.common.collect.Lists;
+import io.milvus.exception.ParamException;
+import io.milvus.grpc.MutationResult;
+
+import java.util.List;
+
+/**
+ * Utility class to wrap response of <code>insert/delete</code> interface.
+ */
+
+
+public class MutationResultWrapper {
+    private final MutationResult result;
+
+    /**
+     * Wraps the given mutation result.
+     *
+     * @param result the gRPC {@code MutationResult}, must not be {@code null}
+     */
+
+
+    public MutationResultWrapper(MutationResult result) {
+        if (result == null) {
+            throw new IllegalArgumentException("MutationResult cannot be null");
+        }
+        this.result = result;
+    }
+
+    /**
+     * Gets the row count of the inserted entities.
+     *
+     * @return <code>int</code> row count of the inserted entities
+     */
+
+
+    public long getInsertCount() {
+        return result.getInsertCnt();
+    }
+
+    /**
+     * Gets the long ID array returned by insert interface.
+     * Throw {@link ParamException} if the primary key type is not int64 type.
+     *
+     * @return List of Long, ID array returned by insert interface
+     */
+
+
+    public List<Long> getLongIDs() throws ParamException {
+        if (result.getIDs().hasIntId()) {
+            return result.getIDs().getIntId().getDataList();
+        } else {
+            throw new ParamException("The primary key is not long type, please try getStringIDs()");
+        }
+    }
+
+    /**
+     * Gets the string ID array returned by insert interface.
+     * Throw {@link ParamException} if the primary key type is not string type.
+     * Note that current release of Milvus doesn't support string type field, thus this method is reserved.
+     *
+     * @return List of String, ID array returned by insert interface
+     */
+
+
+    public List<String> getStringIDs() throws ParamException {
+        if (result.getIDs().hasStrId()) {
+            return result.getIDs().getStrId().getDataList();
+        } else {
+            throw new ParamException("The primary key is not string type, please try getLongIDs()");
+        }
+    }
+
+    /**
+     * Gets the ID array from returned by insert interface.
+     *
+     * @return List of Ids, ID array returned by insert interface
+     */
+
+
+    public List<?> getInsertIDs() {
+        if (result.getIDs().hasIntId()) {
+            return result.getIDs().getIntId().getDataList();
+        } else if (result.getIDs().hasStrId()) {
+            return result.getIDs().getStrId().getDataList();
+        } else {
+            throw new ParamException("No found insertIds, please check your requests");
+        }
+    }
+
+    /**
+     * Gets the ID array from returned by delete interface.
+     *
+     * @return List of Ids, ID array returned by delete interface
+     */
+
+
+    public List<?> getDeleteIDs() {
+        if (result.getIDs().hasIntId()) {
+            return result.getIDs().getIntId().getDataList();
+        } else if (result.getIDs().hasStrId()) {
+            return result.getIDs().getStrId().getDataList();
+        } else {
+            return Lists.newArrayList();
+        }
+    }
+
+    /**
+     * Gets the row count of the deleted entities. Currently, this value is always equal to input row count
+     *
+     * @return <code>int</code> row count of the deleted entities
+     */
+
+
+    public long getDeleteCount() {
+        return result.getDeleteCnt();
+    }
+
+    /**
+     * Get timestamp of the operation marked by server. You can use this timestamp as for guarantee timestamp of query/search api.
+     * <p>
+     * Note: the timestamp is not an absolute timestamp, it is a hybrid value combined by UTC time and internal flags.
+     * We call it TSO, for more information: @see <a href="https://github.com/milvus-io/milvus/blob/master/docs/design_docs/milvus_hybrid_ts_en.md">Hybrid Timestamp in Milvus</a>
+     *
+     * @return <code>int</code> row count of the deleted entities
+     */
+
+
+    public long getOperationTs() {
+        return result.getTimestamp();
+    }
+}

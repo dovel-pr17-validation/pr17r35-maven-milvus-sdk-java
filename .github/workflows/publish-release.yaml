@@ -1,0 +1,257 @@
+name: Publish release to Maven Central
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: read
+
+# CI job names (as reported by GitHub on the PR head commit) the PR that produced the
+# tagged commit must have passed before publishing. Keep these in sync with the
+# `ubuntu` / `windows` job names in maven.yml: renaming a CI job there must update
+# the matching name here or every release validation fails with a "No successful ...
+# check was found" error.
+env:
+  UT_CHECK_UBUNTU: 'Build and test on ubuntu'
+  UT_CHECK_WINDOWS: 'Build and test on windows'
+
+# Maven Central releases are immutable. Do not publish two release tags at the same time,
+# and do not cancel a deployment after it has started uploading artifacts.
+concurrency:
+  group: maven-central-publish
+  queue: max
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate release commit
+    if: github.repository == 'milvus-io/milvus-sdk-java'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      checks: read
+      pull-requests: read
+
+    steps:
+      - name: Checkout release tag and history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify tag ancestry and completed CI
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_SHA: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git fetch --no-tags origin '+refs/heads/*:refs/remotes/origin/*'
+          approved_branch=""
+          if git merge-base --is-ancestor "${TAG_SHA}" origin/master; then
+            approved_branch="master"
+          else
+            while IFS= read -r branch; do
+              branch_name="${branch#origin/}"
+              if [[ "${branch_name}" =~ ^[0-9]+\.[0-9]+$ ]] && \
+                git merge-base --is-ancestor "${TAG_SHA}" "${branch}"; then
+                approved_branch="${branch_name}"
+                break
+              fi
+            done < <(git for-each-ref --format='%(refname:short)' 'refs/remotes/origin/')
+          fi
+          if [[ -z "${approved_branch}" ]]; then
+            echo "Release tag commit ${TAG_SHA} is not contained in master or a numeric release branch." >&2
+            exit 1
+          fi
+          echo "Release commit is contained in ${approved_branch}."
+
+          # CI checks run on the PR head commit (the repo squash-merges PRs, so the
+          # "Build and test" check is recorded on the PR head, not on the merged commit).
+          # Resolve the PR whose squash-merge produced the tagged commit, then verify the
+          # required check passed on that PR's head commit. Requires `checks: read`.
+          pr="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${TAG_SHA}/pulls" \
+            --jq '.[0].number // empty' 2>/dev/null || true)"
+          if [[ -z "${pr}" ]]; then
+            echo "No pull request found for commit ${TAG_SHA}." >&2
+            exit 1
+          fi
+          echo "Commit ${TAG_SHA} was merged from PR #${pr}."
+
+          pr_head="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${pr}" \
+            --jq '.head.sha // empty' 2>/dev/null || true)"
+          if [[ -z "${pr_head}" ]]; then
+            echo "Could not resolve head commit for PR #${pr}." >&2
+            exit 1
+          fi
+          echo "PR #${pr} head commit is ${pr_head}."
+
+          check_runs="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${pr_head}/check-runs?per_page=100")"
+          all_ok=1
+          for check_name in "${{ env.UT_CHECK_UBUNTU }}" "${{ env.UT_CHECK_WINDOWS }}"; do
+            if ! jq -e --arg name "${check_name}" --arg sha "${pr_head}" \
+              '[.check_runs[] | select(.name == $name and .head_sha == $sha and .conclusion == "success")] | length > 0' \
+              <<<"${check_runs}" >/dev/null; then
+              echo "No successful ${check_name} check was found on PR #${pr} head ${pr_head}." >&2
+              all_ok=0
+            fi
+          done
+          if [[ "${all_ok}" -ne 1 ]]; then
+            exit 1
+          fi
+          echo "Required checks passed on PR #${pr} head commit ${pr_head}."
+
+  publish:
+    name: Publish Maven artifacts
+    needs: validate
+    if: needs.validate.result == 'success' && github.repository == 'milvus-io/milvus-sdk-java'
+    runs-on: ubuntu-latest
+    environment: maven-central
+    timeout-minutes: 75
+
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Java and Maven Central credentials
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '8.0.462'
+          cache: maven
+          server-id: central
+          server-username: MAVEN_CENTRAL_USERNAME
+          server-password: MAVEN_CENTRAL_PASSWORD
+          gpg-private-key: ${{ secrets.MAVEN_GPG_PRIVATE_KEY }}
+          gpg-passphrase: MAVEN_GPG_PASSPHRASE
+
+      # GitHub ubuntu runners now default to Maven 3.10.0, which writes maven-metadata-local.xml
+      # into the file:// staging repository. central-publishing-maven-plugin (as configured) only
+      # deletes maven-metadata-central-staging.xml, so the stray file ends up in the bundle and
+      # Sonatype Central rejects the deployment ("Bundle has content that does NOT have a .pom
+      # file"). Pin Maven 3.9.x until the plugin handles maven-metadata-local.xml.
+      # See https://github.com/mavenplugins/central-publishing-maven-plugin/issues/79
+      - name: Set up Maven 3.9.x
+        shell: bash
+        run: |
+          set -euo pipefail
+          MVN_VERSION="3.9.16"
+          curl -fsSL -o "${RUNNER_TEMP}/apache-maven.tar.gz" \
+            "https://repo.maven.apache.org/maven2/org/apache/maven/apache-maven/${MVN_VERSION}/apache-maven-${MVN_VERSION}-bin.tar.gz"
+          tar -xzf "${RUNNER_TEMP}/apache-maven.tar.gz" -C "${RUNNER_TEMP}"
+          echo "${RUNNER_TEMP}/apache-maven-${MVN_VERSION}/bin" >> "${GITHUB_PATH}"
+
+      - name: Validate release tag and project version
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          tag="${GITHUB_REF_NAME}"
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Invalid release tag: $tag. Expected vX.Y.Z."
+            exit 1
+          fi
+
+          tag_version="${tag#v}"
+          project_version="$(mvn --batch-mode --no-transfer-progress help:evaluate \
+            -Dexpression=revision -DforceStdout -q)"
+
+          if [[ "$tag_version" != "$project_version" ]]; then
+            echo "Release tag version $tag_version does not match POM revision $project_version."
+            exit 1
+          fi
+
+          ./scripts/extract_changelog.sh "${tag_version}" > /dev/null
+
+          echo "Publishing milvus-sdk-java $project_version from tag $tag."
+
+      - name: Publish to Maven Central
+        env:
+          MAVEN_CENTRAL_USERNAME: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
+          MAVEN_CENTRAL_PASSWORD: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
+          MAVEN_GPG_PASSPHRASE: ${{ secrets.MAVEN_GPG_PASSPHRASE }}
+        run: >-
+          mvn --batch-mode --no-transfer-progress
+          -Prelease
+          -Dmaven.test.skip=true
+          clean deploy
+
+      # The Spring Boot starter requires Java 17, so the Java 8 deploy above does not include it (its
+      # module is only in the reactor on JDK 17+). Publish it separately; it resolves milvus-sdk-java
+      # from the local repository, where the deploy above installed it.
+      - name: Set up Java 17 for the Spring Boot starter
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+          server-id: central
+          server-username: MAVEN_CENTRAL_USERNAME
+          server-password: MAVEN_CENTRAL_PASSWORD
+          gpg-private-key: ${{ secrets.MAVEN_GPG_PRIVATE_KEY }}
+          gpg-passphrase: MAVEN_GPG_PASSPHRASE
+
+      - name: Publish Spring Boot starter to Maven Central
+        env:
+          MAVEN_CENTRAL_USERNAME: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
+          MAVEN_CENTRAL_PASSWORD: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
+          MAVEN_GPG_PASSPHRASE: ${{ secrets.MAVEN_GPG_PASSPHRASE }}
+        run: >-
+          mvn --batch-mode --no-transfer-progress
+          -Prelease
+          -Dmaven.test.skip=true
+          -pl sdk-spring-boot-starter
+          clean deploy
+
+  release:
+    name: Create GitHub release
+    needs: publish
+    if: needs.publish.result == 'success' && github.repository == 'milvus-io/milvus-sdk-java'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@v4
+
+      - name: Prepare release metadata
+        id: release-info
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          version="${RELEASE_TAG#v}"
+          release_date="$(date -u +%F)"
+          milvus_minor="$(echo "$version" | cut -d. -f1,2)"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "milvus_minor=${milvus_minor}" >> "$GITHUB_OUTPUT"
+
+          changelog="$(./scripts/extract_changelog.sh "${version}")"
+          body_file="${RUNNER_TEMP}/release_body.md"
+          {
+            echo "Release date: ${release_date}"
+            echo "Compatible with Milvus v${milvus_minor}.x"
+            echo
+            printf '%s\n' "${changelog}"
+          } > "${body_file}"
+          echo "body_path=${body_file}" >> "${GITHUB_OUTPUT}"
+
+      - name: Create release
+        uses: ncipollo/release-action@v1
+        with:
+          tag: ${{ github.ref_name }}
+          name: milvus-sdk-java-${{ steps.release-info.outputs.version }}
+          bodyFile: ${{ steps.release-info.outputs.body_path }}
+          draft: false
+          allowUpdates: true
+          omitNameDuringUpdate: true
+          omitBodyDuringUpdate: true
+          token: ${{ secrets.GITHUB_TOKEN }}

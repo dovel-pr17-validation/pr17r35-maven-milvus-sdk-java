@@ -1,0 +1,99 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+package io.milvus.v1;
+
+import com.google.gson.Gson;
+import io.milvus.client.MilvusServiceClient;
+import io.milvus.param.ConnectParam;
+import io.milvus.v1.resourcegroup.ResourceGroupManagement;
+
+public class ResourceGroupExample {
+    private static final ResourceGroupManagement manager;
+    private static final String rgName1 = "rg1";
+    private static final String rgName2 = "rg2";
+    private static Gson gson = new Gson();
+
+    static {
+        ConnectParam connectParam = ConnectParam.newBuilder()
+                .withHost("localhost")
+                .withPort(19530)
+                .withAuthorization("root", "Milvus")
+                .build();
+        manager = new ResourceGroupManagement(new MilvusServiceClient(connectParam));
+    }
+
+    private static void printResourceGroupInfo() throws Exception {
+        manager.listResourceGroups().forEach((name, rg) -> {
+            System.out.println(name);
+            System.out.println(gson.toJson(rg));
+        });
+    }
+
+    public static void main(String[] args) throws Exception {
+        // It's a demo to show how to use resource group management.
+        // It create a database-level-resource-group-control (single replica)
+        // management.
+        // Declarative resource group API can also achieve
+        // replica-level-resource-group-control (multi-replica) management.
+
+        printResourceGroupInfo();
+        // Initialize the cluster with 1 resource group
+        // default_rg: 1
+        manager.initializeCluster(1);
+        printResourceGroupInfo();
+
+        // Add one more node to default rg.
+        manager.scaleResourceGroupTo(ResourceGroupManagement.DEFAULT_RG, 2);
+        // add new query node.
+        // default_rg: 2
+        printResourceGroupInfo();
+
+        // Add a new resource group.
+        manager.createResourceGroup(rgName1, 1);
+        // default_rg: 2, rg1: 0
+        // add new query node.
+        // default_rg: 2, rg1: 1
+        printResourceGroupInfo();
+
+        // Add a new resource group.
+        manager.createResourceGroup(rgName2, 2);
+        // default_rg: 2, rg1: 1, rg2: 0
+        // add new query node.
+        // default_rg: 2, rg1: 1, rg2: 1
+        // add new query node.
+        // default_rg: 2, rg1: 1, rg2: 2
+        printResourceGroupInfo();
+
+        // downscale default_rg to 1
+        manager.scaleResourceGroupTo(ResourceGroupManagement.DEFAULT_RG, 1);
+        // default_rg: 1, rg1: 1, rg2: 2, recycle_rg: 1
+        printResourceGroupInfo();
+
+        manager.scaleResourceGroupTo(ResourceGroupManagement.DEFAULT_RG, 5);
+        manager.scaleResourceGroupTo(rgName1, 1);
+        manager.scaleResourceGroupTo(rgName2, 3);
+        // keep 8 query node in cluster.
+        printResourceGroupInfo();
+
+        // if there are replicas in other rg, transfer them to default together.
+        manager.transferDataBaseToResourceGroup("default", ResourceGroupManagement.DEFAULT_RG);
+        printResourceGroupInfo();
+    }
+}

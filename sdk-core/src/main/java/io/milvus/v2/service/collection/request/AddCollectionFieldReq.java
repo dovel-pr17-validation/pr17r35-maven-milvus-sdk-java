@@ -1,0 +1,149 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+package io.milvus.v2.service.collection.request;
+
+/**
+ * Request parameters for the {@code addCollectionField} API.
+ */
+
+
+public class AddCollectionFieldReq extends AddFieldReq {
+    private String collectionName;
+    private String databaseName;
+
+    private AddCollectionFieldReq(AddCollectionFieldReqBuilder builder) {
+        super(builder);
+        this.collectionName = builder.collectionName;
+        this.databaseName = builder.databaseName;
+    }
+
+    /**
+     * Returns the collection name.
+     *
+     * @return the collection name
+     */
+
+
+    public String getCollectionName() {
+        return collectionName;
+    }
+
+    /**
+     * Sets the collection name.
+     *
+     * @param collectionName the collection name
+     */
+
+
+    public void setCollectionName(String collectionName) {
+        this.collectionName = collectionName;
+    }
+
+    /**
+     * Returns the database name.
+     *
+     * @return the database name
+     */
+
+
+    public String getDatabaseName() {
+        return databaseName;
+    }
+
+    /**
+     * Sets the database name.
+     *
+     * @param databaseName the database name
+     */
+
+
+    public void setDatabaseName(String databaseName) {
+        this.databaseName = databaseName;
+    }
+
+    @Override
+    public String toString() {
+        return "AddCollectionFieldReq{" +
+                "collectionName='" + collectionName + '\'' +
+                ", databaseName='" + databaseName + '\'' +
+                ", " + super.toString() +
+                '}';
+    }
+
+    /**
+     * Creates a new builder for {@link AddCollectionFieldReq}.
+     *
+     * @return the builder
+     */
+
+
+    public static AddCollectionFieldReqBuilder builder() {
+        return new AddCollectionFieldReqBuilder();
+    }
+
+    /**
+     * Builder for {@link AddCollectionFieldReq} class.
+     */
+
+
+    public static class AddCollectionFieldReqBuilder extends AddFieldReq.AddFieldReqBuilder<AddCollectionFieldReqBuilder> {
+        private String collectionName;
+        private String databaseName;
+
+        private AddCollectionFieldReqBuilder() {
+        }
+
+        /**
+         * Sets the collection name.
+         *
+         * @param collectionName the collection name
+         * @return this builder
+         */
+
+
+        public AddCollectionFieldReqBuilder collectionName(String collectionName) {
+            this.collectionName = collectionName;
+            return this;
+        }
+
+        /**
+         * Sets the database name.
+         *
+         * @param databaseName the database name
+         * @return this builder
+         */
+
+
+        public AddCollectionFieldReqBuilder databaseName(String databaseName) {
+            this.databaseName = databaseName;
+            return this;
+        }
+
+        /**
+         * Builds an {@link AddCollectionFieldReq} with the configured parameters.
+         *
+         * @return the request
+         */
+        @Override
+        public AddCollectionFieldReq build() {
+            return new AddCollectionFieldReq(this);
+        }
+    }
+}

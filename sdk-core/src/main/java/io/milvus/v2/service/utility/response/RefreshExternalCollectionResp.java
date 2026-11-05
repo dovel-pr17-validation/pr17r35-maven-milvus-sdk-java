@@ -1,0 +1,95 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+package io.milvus.v2.service.utility.response;
+
+/**
+ * Response returned by the {@code refreshExternalCollection} API.
+ */
+
+
+public class RefreshExternalCollectionResp {
+    private final long jobId;
+
+    private RefreshExternalCollectionResp(RefreshExternalCollectionRespBuilder builder) {
+        this.jobId = builder.jobId;
+    }
+
+    /**
+     * Creates a new builder for {@code RefreshExternalCollectionResp}.
+     *
+     * @return the builder
+     */
+
+
+    public static RefreshExternalCollectionRespBuilder builder() {
+        return new RefreshExternalCollectionRespBuilder();
+    }
+
+    /**
+     * Returns the ID of the refresh external collection job.
+     *
+     * @return the refresh job ID
+     */
+
+
+    public long getJobId() {
+        return jobId;
+    }
+
+    @Override
+    public String toString() {
+        return "RefreshExternalCollectionResp{" +
+                "jobId=" + jobId +
+                '}';
+    }
+
+    /**
+     * Builder for {@link RefreshExternalCollectionResp} class.
+     */
+
+
+    public static class RefreshExternalCollectionRespBuilder {
+        private long jobId;
+
+        /**
+         * Sets the ID of the refresh external collection job.
+         *
+         * @param jobId the refresh job ID
+         * @return this builder
+         */
+
+
+        public RefreshExternalCollectionRespBuilder jobId(long jobId) {
+            this.jobId = jobId;
+            return this;
+        }
+
+        /**
+         * Builds the {@code RefreshExternalCollectionResp}.
+         *
+         * @return the constructed {@code RefreshExternalCollectionResp}
+         */
+
+
+        public RefreshExternalCollectionResp build() {
+            return new RefreshExternalCollectionResp(this);
+        }
+    }
+}

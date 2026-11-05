@@ -1,0 +1,92 @@
+package io.milvus.bulkwriter.writer;
+
+import com.google.gson.Gson;
+import com.google.gson.GsonBuilder;
+import io.milvus.bulkwriter.common.utils.WriterUtils;
+import io.milvus.v2.service.collection.request.CreateCollectionReq;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.BufferedWriter;
+import java.io.IOException;
+import java.util.Map;
+
+import static io.milvus.param.Constant.DYNAMIC_FIELD_NAME;
+
+/**
+ * A FormatFileWriter that writes row data to a local JSON file.
+ *
+ * <p>Rows are serialized as JSON objects and wrapped in a JSON array, which is completed
+ * with a closing bracket when the writer is closed.</p>
+ */
+
+
+public class JSONFileWriter implements FormatFileWriter {
+    private static final Logger logger = LoggerFactory.getLogger(JSONFileWriter.class);
+
+    private BufferedWriter writer;
+    private CreateCollectionReq.CollectionSchema collectionSchema;
+    private String filePath;
+    /**
+     * Creates a JSON file writer that writes row data to a local JSON file.
+     *
+     * @param collectionSchema the collection schema
+     * @param filePathPrefix the file path prefix; the {@code .json} suffix is appended
+     * @throws IOException if the output file cannot be created
+     */
+
+
+    public JSONFileWriter(CreateCollectionReq.CollectionSchema collectionSchema, String filePathPrefix) throws IOException {
+        this.collectionSchema = collectionSchema;
+        initFilePath(filePathPrefix);
+        initWriter();
+    }
+
+    private void initFilePath(String filePathPrefix) {
+        this.filePath = filePathPrefix + ".json";
+    }
+
+    private void initWriter() throws IOException {
+        this.writer = new BufferedWriter(new java.io.FileWriter(filePath));
+    }
+
+    @Override
+    public void appendRow(Map<String, Object> rowValues, boolean firstWrite) throws IOException {
+        Gson gson = new GsonBuilder().serializeNulls().create();
+        rowValues.keySet().removeIf(key -> key.equals(DYNAMIC_FIELD_NAME) && !this.collectionSchema.isEnableDynamicField());
+        rowValues.replaceAll((key, value) -> WriterUtils.normalizeValue(value));
+
+        try {
+            if (firstWrite) {
+                writer.write("[\n");
+            } else {
+                writer.write(",");
+                writer.newLine();
+            }
+            String json = gson.toJson(rowValues);
+            writer.write(json);
+        } catch (IOException e) {
+            logger.error("{} appendRow error when writing to file {}", this.getClass().getSimpleName(), filePath, e);
+            throw e;
+        }
+    }
+
+    @Override
+    public String getFilePath() {
+        return filePath;
+    }
+
+    @Override
+    public void close() throws IOException {
+        appendEnd();
+        this.writer.close();
+    }
+
+    /**
+     * For JSON format data, at the end, it is necessary to append "]" to complete the data.
+     */
+    private void appendEnd() throws IOException {
+        this.writer.newLine();
+        this.writer.write("]\n");
+    }
+}

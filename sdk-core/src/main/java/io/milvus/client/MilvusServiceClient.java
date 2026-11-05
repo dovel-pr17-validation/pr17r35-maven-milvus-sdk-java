@@ -1,0 +1,1148 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+package io.milvus.client;
+
+import com.google.common.util.concurrent.FutureCallback;
+import com.google.common.util.concurrent.Futures;
+import com.google.common.util.concurrent.ListenableFuture;
+import com.google.common.util.concurrent.MoreExecutors;
+import io.grpc.*;
+import io.grpc.Status;
+import io.grpc.netty.shaded.io.grpc.netty.GrpcSslContexts;
+import io.grpc.netty.shaded.io.grpc.netty.NettyChannelBuilder;
+import io.grpc.netty.shaded.io.netty.handler.ssl.SslContext;
+import io.grpc.stub.MetadataUtils;
+import io.milvus.common.interceptor.ClientRequestInterceptor;
+import io.milvus.common.interceptor.IdentifierInterceptor;
+import io.milvus.common.utils.ExceptionUtils;
+import io.milvus.exception.MilvusException;
+import io.milvus.exception.ServerException;
+import io.milvus.grpc.*;
+import io.milvus.orm.iterator.QueryIterator;
+import io.milvus.orm.iterator.SearchIterator;
+import io.milvus.param.*;
+import io.milvus.param.alias.AlterAliasParam;
+import io.milvus.param.alias.CreateAliasParam;
+import io.milvus.param.alias.DropAliasParam;
+import io.milvus.param.alias.ListAliasesParam;
+import io.milvus.param.bulkinsert.BulkInsertParam;
+import io.milvus.param.bulkinsert.GetBulkInsertStateParam;
+import io.milvus.param.bulkinsert.ListBulkInsertTasksParam;
+import io.milvus.param.collection.*;
+import io.milvus.param.control.*;
+import io.milvus.param.credential.CreateCredentialParam;
+import io.milvus.param.credential.DeleteCredentialParam;
+import io.milvus.param.credential.ListCredUsersParam;
+import io.milvus.param.credential.UpdateCredentialParam;
+import io.milvus.param.dml.*;
+import io.milvus.param.highlevel.collection.CreateSimpleCollectionParam;
+import io.milvus.param.highlevel.collection.ListCollectionsParam;
+import io.milvus.param.highlevel.collection.response.ListCollectionsResponse;
+import io.milvus.param.highlevel.dml.*;
+import io.milvus.param.highlevel.dml.response.*;
+import io.milvus.param.index.*;
+import io.milvus.param.partition.*;
+import io.milvus.param.resourcegroup.*;
+import io.milvus.param.role.*;
+import io.milvus.telemetry.ClientTelemetryManager;
+import io.milvus.telemetry.TelemetryInterceptor;
+import io.milvus.v2.utils.ClientUtils;
+import org.apache.commons.lang3.StringUtils;
+
+import java.io.File;
+import java.io.IOException;
+import java.net.InetAddress;
+import java.net.UnknownHostException;
+import java.time.LocalDateTime;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.Callable;
+import java.util.concurrent.TimeUnit;
+
+/**
+ * V1 gRPC client. It is the entry point for Milvus operations, covering collection,
+ * index, partition, DML, DQL, RBAC, resource group and other APIs.
+ */
+
+
+public class MilvusServiceClient extends AbstractMilvusGrpcClient {
+
+    private ManagedChannel channel;
+    private MilvusServiceGrpc.MilvusServiceBlockingStub blockingStub;
+    private MilvusServiceGrpc.MilvusServiceFutureStub futureStub;
+    private final long rpcDeadlineMs;
+    private long timeoutMs = 0;
+    private RetryParam retryParam = RetryParam.newBuilder().build();
+    private String currentDatabaseName;
+    private final String endpoint;
+    private final ClientTelemetryManager telemetry;
+    private final boolean ownsTelemetry;
+    private final ThreadLocal<String> clientRequestId;
+    private final ThreadLocal<Integer> logicalOperationDepth =
+            ThreadLocal.withInitial(() -> 0);
+
+    /**
+     * Constructs a MilvusServiceClient with the given connect parameters.
+     *
+     * @param connectParam the connect parameters
+     */
+
+
+    public MilvusServiceClient(ConnectParam connectParam) {
+        ExceptionUtils.checkNotNull(connectParam, connectParam.getClass().getSimpleName());
+        this.rpcDeadlineMs = connectParam.getRpcDeadlineMs();
+        this.endpoint = connectParam.getHost() + ":" + connectParam.getPort();
+        this.telemetry = new ClientTelemetryManager(
+                connectParam.getTelemetryConfig(),
+                connectParam.getUserName(),
+                getSDKVersion(),
+                () -> currentDatabaseName,
+                () -> telemetryUserConfig(connectParam));
+        this.ownsTelemetry = true;
+        this.clientRequestId = connectParam.getClientRequestId();
+
+        Metadata metadata = new Metadata();
+        metadata.put(Metadata.Key.of("authorization", Metadata.ASCII_STRING_MARSHALLER), connectParam.getAuthorization());
+        if (StringUtils.isNotEmpty(connectParam.getDatabaseName())) {
+            currentDatabaseName = connectParam.getDatabaseName();
+            metadata.put(Metadata.Key.of("dbname", Metadata.ASCII_STRING_MARSHALLER), connectParam.getDatabaseName());
+        }
+
+        List<ClientInterceptor> clientInterceptors = new ArrayList<>();
+        clientInterceptors.add(MetadataUtils.newAttachHeadersInterceptor(metadata));
+        clientInterceptors.add(new ClientRequestInterceptor(connectParam.getClientRequestId()));
+        clientInterceptors.add(new TelemetryInterceptor(telemetry, connectParam.getClientRequestId()));
+
+        try {
+            if (StringUtils.isNotEmpty(connectParam.getServerPemPath())) {
+                // one-way tls
+                SslContext sslContext = GrpcSslContexts.forClient()
+                        .trustManager(new File(connectParam.getServerPemPath()))
+                        .build();
+                NettyChannelBuilder builder = NettyChannelBuilder.forAddress(connectParam.getHost(), connectParam.getPort())
+                        .overrideAuthority(connectParam.getServerName())
+                        .sslContext(sslContext)
+                        .maxInboundMessageSize(Integer.MAX_VALUE)
+                        .keepAliveTime(connectParam.getKeepAliveTimeMs(), TimeUnit.MILLISECONDS)
+                        .keepAliveTimeout(connectParam.getKeepAliveTimeoutMs(), TimeUnit.MILLISECONDS)
+                        .keepAliveWithoutCalls(connectParam.isKeepAliveWithoutCalls())
+                        .idleTimeout(connectParam.getIdleTimeoutMs(), TimeUnit.MILLISECONDS)
+                        .intercept(clientInterceptors);
+                // Add proxy configuration if proxy address is set
+                if (StringUtils.isNotEmpty(connectParam.getProxyAddress())) {
+                    ClientUtils.configureProxy(builder, connectParam.getProxyAddress());
+                }
+                if (connectParam.isSecure()) {
+                    builder.useTransportSecurity();
+                }
+                channel = builder.build();
+            } else if (StringUtils.isNotEmpty(connectParam.getClientPemPath())
+                    && StringUtils.isNotEmpty(connectParam.getClientKeyPath())
+                    && StringUtils.isNotEmpty(connectParam.getCaPemPath())) {
+                // tow-way tls
+                SslContext sslContext = GrpcSslContexts.forClient()
+                        .trustManager(new File(connectParam.getCaPemPath()))
+                        .keyManager(new File(connectParam.getClientPemPath()), new File(connectParam.getClientKeyPath()))
+                        .build();
+                NettyChannelBuilder builder = NettyChannelBuilder.forAddress(connectParam.getHost(), connectParam.getPort())
+                        .sslContext(sslContext)
+                        .maxInboundMessageSize(Integer.MAX_VALUE)
+                        .keepAliveTime(connectParam.getKeepAliveTimeMs(), TimeUnit.MILLISECONDS)
+                        .keepAliveTimeout(connectParam.getKeepAliveTimeoutMs(), TimeUnit.MILLISECONDS)
+                        .keepAliveWithoutCalls(connectParam.isKeepAliveWithoutCalls())
+                        .idleTimeout(connectParam.getIdleTimeoutMs(), TimeUnit.MILLISECONDS)
+                        .intercept(clientInterceptors);
+
+                // Add proxy configuration if proxy address is set
+                if (StringUtils.isNotEmpty(connectParam.getProxyAddress())) {
+                    ClientUtils.configureProxy(builder, connectParam.getProxyAddress());
+                }
+                if (connectParam.isSecure()) {
+                    builder.useTransportSecurity();
+                }
+                if (StringUtils.isNotEmpty(connectParam.getServerName())) {
+                    builder.overrideAuthority(connectParam.getServerName());
+                }
+                channel = builder.build();
+            } else {
+                // no tls
+                ManagedChannelBuilder<?> builder = ManagedChannelBuilder.forAddress(connectParam.getHost(), connectParam.getPort())
+                        .usePlaintext()
+                        .maxInboundMessageSize(Integer.MAX_VALUE)
+                        .keepAliveTime(connectParam.getKeepAliveTimeMs(), TimeUnit.MILLISECONDS)
+                        .keepAliveTimeout(connectParam.getKeepAliveTimeoutMs(), TimeUnit.MILLISECONDS)
+                        .keepAliveWithoutCalls(connectParam.isKeepAliveWithoutCalls())
+                        .idleTimeout(connectParam.getIdleTimeoutMs(), TimeUnit.MILLISECONDS)
+                        .intercept(clientInterceptors);
+                if (StringUtils.isNotEmpty(connectParam.getProxyAddress())) {
+                    ClientUtils.configureProxy(builder, connectParam.getProxyAddress());
+                }
+                if (connectParam.isSecure()) {
+                    builder.useTransportSecurity();
+                }
+                channel = builder.build();
+            }
+        } catch (IOException e) {
+            String msg = "Failed to open credentials file. Error: " + e.getMessage();
+            logError(msg);
+            throw new RuntimeException(msg);
+        }
+
+        assert channel != null;
+
+        try {
+            // Use a temporary stub to call Connect RPC and obtain the server-assigned identifier
+            blockingStub = MilvusServiceGrpc.newBlockingStub(channel);
+            futureStub = MilvusServiceGrpc.newFutureStub(channel);
+
+            // calls a RPC Connect() to the remote server, and sends the client info to the server
+            // so that the server knows which client is interacting, especially for accesses log.
+            this.timeoutMs = connectParam.getConnectTimeoutMs(); // set this value to connectTimeoutMs to control the retry()
+            R<ConnectResponse> resp = this.retry(() -> connect(connectParam));
+            if (resp.getStatus() != R.Status.Success.getCode()) {
+                String msg = "Failed to initialize connection. Error: " + resp.getMessage();
+                logError(msg);
+                throw new RuntimeException(msg);
+            }
+
+            // Wrap channel with identifier interceptor so that every subsequent RPC
+            // carries the identifier in gRPC metadata, aligning with pymilvus behavior.
+            long identifier = resp.getData().getIdentifier();
+            Channel interceptedChannel = ClientInterceptors.intercept(channel,
+                    new IdentifierInterceptor(identifier));
+            blockingStub = MilvusServiceGrpc.newBlockingStub(interceptedChannel);
+            futureStub = MilvusServiceGrpc.newFutureStub(interceptedChannel);
+            telemetry.setStub(ClientTelemetryServiceGrpc.newBlockingStub(interceptedChannel));
+            telemetry.start();
+        } catch (Exception e) {
+            // close the channel if connect() throws exception, avoid leakage
+            try {
+                close(3);
+            } catch (InterruptedException ignored) {
+                Thread.currentThread().interrupt();
+            }
+            throw e;
+        }
+        this.timeoutMs = 0; // reset the timeout value to default
+    }
+
+    protected MilvusServiceClient(MilvusServiceClient src) {
+        this.channel = src.channel;
+        this.blockingStub = src.blockingStub;
+        this.futureStub = src.futureStub;
+        this.rpcDeadlineMs = src.rpcDeadlineMs;
+        this.timeoutMs = src.timeoutMs;
+        this.logLevel = src.logLevel;
+        this.retryParam = src.retryParam;
+        this.currentDatabaseName = src.currentDatabaseName;
+        this.endpoint = src.endpoint;
+        this.telemetry = src.telemetry;
+        // Fluent wrappers share the channel and therefore share its lifecycle. Closing any
+        // wrapper closes that channel, so it must close the shared telemetry worker as well.
+        this.ownsTelemetry = true;
+        this.clientRequestId = src.clientRequestId;
+    }
+
+    @Override
+    protected MilvusServiceGrpc.MilvusServiceBlockingStub blockingStub() {
+        if (this.rpcDeadlineMs > 0) {
+            return this.blockingStub.withWaitForReady()
+                    .withDeadlineAfter(this.rpcDeadlineMs, TimeUnit.MILLISECONDS);
+        }
+        return this.blockingStub;
+    }
+
+    @Override
+    protected MilvusServiceGrpc.MilvusServiceFutureStub futureStub() {
+        return this.futureStub;
+    }
+
+    @Override
+    public boolean clientIsReady() {
+        return channel != null && !channel.isShutdown() && !channel.isTerminated();
+    }
+
+    @Override
+    protected String currentDbName() {
+        return currentDatabaseName;
+    }
+
+    @Override
+    protected String currentEndpoint() {
+        return endpoint;
+    }
+
+    @Override
+    public void close(long maxWaitSeconds) throws InterruptedException {
+        if (ownsTelemetry) {
+            telemetry.close();
+        }
+        channel.shutdownNow();
+        channel.awaitTermination(maxWaitSeconds, TimeUnit.SECONDS);
+    }
+
+    /**
+     * Returns the telemetry manager for metrics inspection and custom command handlers.
+     *
+     * @return the telemetry manager
+     */
+
+
+    public ClientTelemetryManager getTelemetry() {
+        return telemetry;
+    }
+
+    private static Map<String, Object> telemetryUserConfig(ConnectParam connectParam) {
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("address", connectParam.getHost() + ":" + connectParam.getPort());
+        result.put("username", connectParam.getUserName());
+        result.put("db_name", connectParam.getDatabaseName());
+        result.put("secure", connectParam.isSecure());
+        result.put("connect_timeout_ms", connectParam.getConnectTimeoutMs());
+        result.put("rpc_deadline_ms", connectParam.getRpcDeadlineMs());
+        return result;
+    }
+
+    private static class TimeoutInterceptor implements ClientInterceptor {
+        private final long timeoutMillis;
+
+        TimeoutInterceptor(long timeoutMillis) {
+            this.timeoutMillis = timeoutMillis;
+        }
+
+        @Override
+        public <ReqT, RespT> ClientCall<ReqT, RespT> interceptCall(
+                MethodDescriptor<ReqT, RespT> method, CallOptions callOptions, Channel next) {
+            return next.newCall(method, callOptions.withDeadlineAfter(timeoutMillis, TimeUnit.MILLISECONDS));
+        }
+    }
+
+    @Override
+    public MilvusClient withTimeout(long timeout, TimeUnit timeoutUnit) {
+        final long timeoutMillis = timeoutUnit.toMillis(timeout);
+        final TimeoutInterceptor timeoutInterceptor = new TimeoutInterceptor(timeoutMillis);
+        final MilvusServiceGrpc.MilvusServiceBlockingStub blockingStubTimeout =
+                this.blockingStub.withInterceptors(timeoutInterceptor);
+        final MilvusServiceGrpc.MilvusServiceFutureStub futureStubTimeout =
+                this.futureStub.withInterceptors(timeoutInterceptor);
+
+        MilvusServiceClient newClient = new MilvusServiceClient(this) {
+            @Override
+            protected MilvusServiceGrpc.MilvusServiceBlockingStub blockingStub() {
+                return blockingStubTimeout;
+            }
+
+            @Override
+            protected MilvusServiceGrpc.MilvusServiceFutureStub futureStub() {
+                return futureStubTimeout;
+            }
+        };
+        newClient.timeoutMs = timeoutMillis;
+        return newClient;
+    }
+
+    @Override
+    public MilvusClient withRetry(RetryParam retryParam) {
+        MilvusServiceClient newClient = new MilvusServiceClient(this);
+        newClient.retryParam = retryParam;
+        return newClient;
+    }
+
+    @Override
+    public MilvusClient withRetry(int retryTimes) {
+        if (retryTimes <= 0) {
+            return this;
+        }
+
+        MilvusServiceClient newClient = new MilvusServiceClient(this);
+        newClient.retryParam.setMaxRetryTimes(retryTimes);
+        return newClient;
+    }
+
+    @Override
+    public MilvusClient withRetryInterval(long interval, TimeUnit timeUnit) {
+        if (interval <= 0) {
+            return this;
+        }
+
+        // to compatible with the old behavior
+        MilvusServiceClient newClient = new MilvusServiceClient(this);
+        newClient.retryParam.setInitialBackOffMs(timeUnit.toMillis(interval));
+        newClient.retryParam.setMaxBackOffMs(timeUnit.toMillis(interval));
+        return newClient;
+    }
+
+    private <T> R<T> retry(Callable<R<T>> callable) {
+        int maxRetryTimes = this.retryParam.getMaxRetryTimes();
+        // no retry, direct call the method
+        if (maxRetryTimes <= 1) {
+            try {
+                return callable.call();
+            } catch (Exception e) {
+                return R.failed(e);
+            }
+        }
+
+        // method to check timeout
+        long begin = System.currentTimeMillis();
+        Callable<Boolean> timeoutChecker = () -> {
+            long current = System.currentTimeMillis();
+            long cost = (current - begin);
+            if (this.timeoutMs > 0 && cost >= this.timeoutMs) {
+                return Boolean.TRUE;
+            }
+            return Boolean.FALSE;
+        };
+
+        // retry within timeout
+        long retryIntervalMs = this.retryParam.getInitialBackOffMs();
+        for (int k = 1; k <= maxRetryTimes; k++) {
+            try {
+                R<T> resp = callable.call();
+                if (resp.getStatus() == R.Status.Success.getCode()) {
+                    return resp;
+                }
+
+                Exception e = resp.getException();
+                if (e instanceof StatusRuntimeException) {
+                    // for rpc exception, some error cannot be retried
+                    StatusRuntimeException rpcException = (StatusRuntimeException) e;
+                    Status.Code code = rpcException.getStatus().getCode();
+                    if (code == Status.DEADLINE_EXCEEDED.getCode()
+                            || code == Status.PERMISSION_DENIED.getCode()
+                            || code == Status.UNAUTHENTICATED.getCode()
+                            || code == Status.INVALID_ARGUMENT.getCode()
+                            || code == Status.ALREADY_EXISTS.getCode()
+                            || code == Status.RESOURCE_EXHAUSTED.getCode()
+                            || code == Status.UNIMPLEMENTED.getCode()) {
+                        return resp;
+                    }
+
+                    if (timeoutChecker.call() == Boolean.TRUE) {
+                        String msg = String.format("Retry timeout: %dms, maxRetry:%d, retries: %d, reason: %s",
+                                this.timeoutMs, maxRetryTimes, k, e);
+                        throw new MilvusException(msg, code.value());
+                    }
+                } else if (e instanceof ServerException) {
+                    ServerException serverException = (ServerException) e;
+                    if (timeoutChecker.call() == Boolean.TRUE) {
+                        String msg = String.format("Retry timeout: %dms, maxRetry:%d, retries: %d, reason: %s",
+                                this.timeoutMs, maxRetryTimes, k, e);
+                        throw new MilvusException(msg, serverException.getStatus());
+                    }
+
+                    // for server-side returned error, only retry for rate limit
+                    // in new error codes of v2.3, rate limit error value is 8
+                    if (retryParam.isRetryOnRateLimit() &&
+                            (serverException.getCompatibleCode() == ErrorCode.RateLimit ||
+                                    serverException.getStatus() == 8)) {
+                    } else {
+                        return resp;
+                    }
+                } else {
+                    return resp;
+                }
+
+                if (k >= maxRetryTimes) {
+                    // finish retry loop, return the response of the last retry
+                    String msg = String.format("Finish %d retry times, stop retry", maxRetryTimes);
+                    logError(msg);
+                    return resp;
+                } else {
+                    // sleep for interval
+                    // print log, follow the pymilvus logic
+                    if (k > 3) {
+                        logWarning(String.format("Retry(%d) with interval %dms. Reason: %s",
+                                k, retryIntervalMs, e));
+                    }
+                    TimeUnit.MILLISECONDS.sleep(retryIntervalMs);
+                }
+
+                // reset the next interval value
+                retryIntervalMs = retryIntervalMs * this.retryParam.getBackOffMultiplier();
+                if (retryIntervalMs > this.retryParam.getMaxBackOffMs()) {
+                    retryIntervalMs = this.retryParam.getMaxBackOffMs();
+                }
+            } catch (Exception e) {
+                logError(e.getMessage());
+                return R.failed(e);
+            }
+        }
+        String msg = String.format("Finish %d retry times, stop retry", maxRetryTimes);
+        logError(msg);
+        return R.failed(new RuntimeException(msg));
+    }
+
+    private String captureClientRequestId() {
+        String value = clientRequestId == null ? null : clientRequestId.get();
+        return ClientRequestInterceptor.isValidClientRequestId(value) ? value : "";
+    }
+
+    private <T> R<T> recordLogicalOperation(
+            String operation, String collection, java.util.function.Supplier<R<T>> supplier) {
+        int depth = logicalOperationDepth.get();
+        logicalOperationDepth.set(depth + 1);
+        long startNanos = System.nanoTime();
+        String requestId = captureClientRequestId();
+        try (ClientTelemetryManager.LogicalOperationScope ignored =
+                     telemetry.beginLogicalOperation()) {
+            R<T> result = supplier.get();
+            if (depth == 0) {
+                recordLogicalResult(operation, collection, startNanos, resultError(result), requestId);
+            }
+            return result;
+        } catch (RuntimeException | Error throwable) {
+            if (depth == 0) {
+                recordLogicalResult(operation, collection, startNanos, throwable.toString(), requestId);
+            }
+            throw throwable;
+        } finally {
+            resetLogicalOperationDepth(depth);
+        }
+    }
+
+    private <T> ListenableFuture<R<T>> recordLogicalOperationAsync(
+            String operation, String collection,
+            java.util.function.Supplier<ListenableFuture<R<T>>> supplier) {
+        int depth = logicalOperationDepth.get();
+        logicalOperationDepth.set(depth + 1);
+        long startNanos = System.nanoTime();
+        String requestId = captureClientRequestId();
+        final ListenableFuture<R<T>> future;
+        try (ClientTelemetryManager.LogicalOperationScope ignored =
+                     telemetry.beginLogicalOperation()) {
+            future = supplier.get();
+        } catch (RuntimeException | Error throwable) {
+            if (depth == 0) {
+                recordLogicalResult(operation, collection, startNanos, throwable.toString(), requestId);
+            }
+            throw throwable;
+        } finally {
+            resetLogicalOperationDepth(depth);
+        }
+        if (depth == 0) {
+            Futures.addCallback(future, new FutureCallback<R<T>>() {
+                @Override
+                public void onSuccess(R<T> result) {
+                    recordLogicalResult(operation, collection, startNanos, resultError(result), requestId);
+                }
+
+                @Override
+                public void onFailure(Throwable throwable) {
+                    recordLogicalResult(operation, collection, startNanos, throwable.toString(), requestId);
+                }
+            }, MoreExecutors.directExecutor());
+        }
+        return future;
+    }
+
+    private void resetLogicalOperationDepth(int depth) {
+        if (depth == 0) {
+            logicalOperationDepth.remove();
+        } else {
+            logicalOperationDepth.set(depth);
+        }
+    }
+
+    private static String resultError(R<?> result) {
+        if (result != null && Integer.valueOf(R.Status.Success.getCode()).equals(result.getStatus())) {
+            return "";
+        }
+        if (result != null && result.getException() != null) {
+            return result.getException().toString();
+        }
+        return result == null ? "Milvus operation returned null"
+                : "Milvus operation failed with status " + result.getStatus();
+    }
+
+    private void recordLogicalResult(
+            String operation, String collection, long startNanos, String error, String requestId) {
+        try {
+            telemetry.recordOperation(operation, collection == null ? "" : collection,
+                    startNanos, error, requestId);
+        } catch (RuntimeException ignored) {
+            // Telemetry is best-effort and must never replace the operation result.
+        }
+    }
+
+    /**
+     * This method is internal used, it calls a RPC Connect() to the remote server,
+     * and sends the client info to the server so that the server knows which client is interacting,
+     * especially for accesses log.
+     * <p>
+     * The info includes:
+     * 1. username(if Authentication is enabled)
+     * 2. the client computer's name
+     * 3. sdk language type and version
+     * 4. the client's local time
+     */
+    private R<ConnectResponse> connect(ConnectParam connectParam) {
+        ExceptionUtils.checkNotNull(connectParam, connectParam.getClass().getSimpleName());
+        ClientInfo.Builder infoBuilder = ClientInfo.newBuilder()
+                .setSdkType("Java")
+                .setSdkVersion(getSDKVersion())
+                .setUser(connectParam.getUserName())
+                .setHost(getHostName())
+                .setLocalTime(getLocalTimeStr());
+        if (connectParam.getOption() != null && !connectParam.getOption().isEmpty()) {
+            infoBuilder.putAllReserved(connectParam.getOption());
+        }
+        ClientInfo info = infoBuilder.build();
+        ConnectRequest req = ConnectRequest.newBuilder().setClientInfo(info).build();
+        ConnectResponse resp = this.blockingStub.withWaitForReady()
+                .withDeadlineAfter(connectParam.getConnectTimeoutMs(), TimeUnit.MILLISECONDS)
+                .connect(req);
+        if (resp.getStatus().getCode() != 0 || !resp.getStatus().getErrorCode().equals(ErrorCode.Success)) {
+            throw new RuntimeException("Failed to initialize connection. Error: " + resp.getStatus().getReason());
+        }
+        return R.success(resp);
+    }
+
+    private String getHostName() {
+        try {
+            InetAddress address = InetAddress.getLocalHost();
+            return address.getHostName();
+        } catch (UnknownHostException e) {
+            logWarning("Failed to get host name! Exception:{}", e);
+            return "Unknown";
+        }
+    }
+
+    private String getLocalTimeStr() {
+        LocalDateTime now = LocalDateTime.now();
+        return now.toString();
+    }
+
+    private String getSDKVersion() {
+        Package pkg = MilvusServiceClient.class.getPackage();
+        String ver = pkg.getImplementationVersion();
+        if (ver == null) {
+            return "";
+        }
+        return ver;
+    }
+
+    @Override
+    public void setLogLevel(LogLevel level) {
+        logLevel = level;
+    }
+
+    @Override
+    public R<Boolean> hasCollection(HasCollectionParam requestParam) {
+        return retry(() -> super.hasCollection(requestParam));
+    }
+
+    @Override
+    public R<RpcStatus> createDatabase(CreateDatabaseParam requestParam) {
+        return retry(() -> super.createDatabase(requestParam));
+    }
+
+    @Override
+    public R<RpcStatus> dropDatabase(DropDatabaseParam requestParam) {
+        return retry(() -> super.dropDatabase(requestParam));
+    }
+
+    @Override
+    public R<ListDatabasesResponse> listDatabases() {
+        return retry(super::listDatabases);
+    }
+
+    @Override
+    public R<RpcStatus> alterDatabase(AlterDatabaseParam requestParam) {
+        return retry(() -> super.alterDatabase(requestParam));
+    }
+
+    @Override
+    public R<DescribeDatabaseResponse> describeDatabase(DescribeDatabaseParam requestParam) {
+        return retry(() -> super.describeDatabase(requestParam));
+    }
+
+    @Override
+    public R<RpcStatus> createCollection(CreateCollectionParam requestParam) {
+        return retry(() -> super.createCollection(requestParam));
+    }
+
+    @Override
+    public R<RpcStatus> dropCollection(DropCollectionParam requestParam) {
+        return retry(() -> super.dropCollection(requestParam));
+    }
+
+    @Override
+    public R<RpcStatus> loadCollection(LoadCollectionParam requestParam) {
+        return retry(() -> super.loadCollection(requestParam));
+    }
+
+    @Override
+    public R<RpcStatus> releaseCollection(ReleaseCollectionParam requestParam) {
+        return retry(() -> super.releaseCollection(requestParam));
+    }
+
+    @Override
+    public R<DescribeCollectionResponse> describeCollection(DescribeCollectionParam requestParam) {
+        return retry(() -> super.describeCollection(requestParam));
+    }
+
+    @Override
+    public R<GetCollectionStatisticsResponse> getCollectionStatistics(GetCollectionStatisticsParam requestParam) {
+        return retry(() -> super.getCollectionStatistics(requestParam));
+    }
+
+    @Override
+    public R<RpcStatus> renameCollection(RenameCollectionParam requestParam) {
+        return retry(() -> super.renameCollection(requestParam));
+    }
+
+    @Override
+    public R<ShowCollectionsResponse> showCollections(ShowCollectionsParam requestParam) {
+        return retry(() -> super.showCollections(requestParam));
+    }
+
+    @Override
+    public R<RpcStatus> alterCollection(AlterCollectionParam requestParam) {
+        return retry(() -> super.alterCollection(requestParam));
+    }
+
+    @Override
+    public R<FlushResponse> flush(FlushParam requestParam) {
+        return retry(() -> super.flush(requestParam));
+    }
+
+    @Override
+    public R<FlushAllResponse> flushAll(boolean syncFlushAll, long syncFlushAllWaitingInterval, long syncFlushAllTimeout) {
+        return retry(() -> super.flushAll(syncFlushAll, syncFlushAllWaitingInterval, syncFlushAllTimeout));
+    }
+
+    @Override
+    public R<RpcStatus> createPartition(CreatePartitionParam requestParam) {
+        return retry(() -> super.createPartition(requestParam));
+    }
+
+    @Override
+    public R<RpcStatus> dropPartition(DropPartitionParam requestParam) {
+        return retry(() -> super.dropPartition(requestParam));
+    }
+
+    @Override
+    public R<Boolean> hasPartition(HasPartitionParam requestParam) {
+        return retry(() -> super.hasPartition(requestParam));
+    }
+
+    @Override
+    public R<RpcStatus> loadPartitions(LoadPartitionsParam requestParam) {
+        return retry(() -> super.loadPartitions(requestParam));
+    }
+
+    @Override
+    public R<RpcStatus> releasePartitions(ReleasePartitionsParam requestParam) {
+        return retry(() -> super.releasePartitions(requestParam));
+    }
+
+    @Override
+    public R<GetPartitionStatisticsResponse> getPartitionStatistics(GetPartitionStatisticsParam requestParam) {
+        return retry(() -> super.getPartitionStatistics(requestParam));
+    }
+
+    @Override
+    public R<ShowPartitionsResponse> showPartitions(ShowPartitionsParam requestParam) {
+        return retry(() -> super.showPartitions(requestParam));
+    }
+
+    @Override
+    public R<RpcStatus> createAlias(CreateAliasParam requestParam) {
+        return retry(() -> super.createAlias(requestParam));
+    }
+
+    @Override
+    public R<RpcStatus> dropAlias(DropAliasParam requestParam) {
+        return retry(() -> super.dropAlias(requestParam));
+    }
+
+    @Override
+    public R<RpcStatus> alterAlias(AlterAliasParam requestParam) {
+        return retry(() -> super.alterAlias(requestParam));
+    }
+
+    @Override
+    public R<ListAliasesResponse> listAliases(ListAliasesParam requestParam) {
+        return retry(() -> super.listAliases(requestParam));
+    }
+
+    @Override
+    public R<RpcStatus> createIndex(CreateIndexParam requestParam) {
+        return retry(() -> super.createIndex(requestParam));
+    }
+
+    @Override
+    public R<RpcStatus> dropIndex(DropIndexParam requestParam) {
+        return retry(() -> super.dropIndex(requestParam));
+    }
+
+    @Override
+    public R<DescribeIndexResponse> describeIndex(DescribeIndexParam requestParam) {
+        return retry(() -> super.describeIndex(requestParam));
+    }
+
+    @Override
+    public R<GetIndexStateResponse> getIndexState(GetIndexStateParam requestParam) {
+        ExceptionUtils.checkNotNull(requestParam, requestParam.getClass().getSimpleName());
+        return retry(() -> super.getIndexState(requestParam));
+    }
+
+    @Override
+    public R<GetIndexBuildProgressResponse> getIndexBuildProgress(GetIndexBuildProgressParam requestParam) {
+        ExceptionUtils.checkNotNull(requestParam, requestParam.getClass().getSimpleName());
+        return retry(() -> super.getIndexBuildProgress(requestParam));
+    }
+
+    @Override
+    public R<MutationResult> insert(InsertParam requestParam) {
+        String collection = requestParam == null ? "" : requestParam.getCollectionName();
+        return recordLogicalOperation("Insert", collection,
+                () -> retry(() -> super.insert(requestParam)));
+    }
+
+    @Override
+    public R<MutationResult> upsert(UpsertParam requestParam) {
+        String collection = requestParam == null ? "" : requestParam.getCollectionName();
+        return recordLogicalOperation("Upsert", collection,
+                () -> retry(() -> super.upsert(requestParam)));
+    }
+
+    @Override
+    public R<MutationResult> delete(DeleteParam requestParam) {
+        String collection = requestParam == null ? "" : requestParam.getCollectionName();
+        return recordLogicalOperation("Delete", collection,
+                () -> retry(() -> super.delete(requestParam)));
+    }
+
+    @Override
+    public R<SearchResults> search(SearchParam requestParam) {
+        String collection = requestParam == null ? "" : requestParam.getCollectionName();
+        return recordLogicalOperation("Search", collection,
+                () -> retry(() -> super.search(requestParam)));
+    }
+
+    @Override
+    public R<SearchResults> hybridSearch(HybridSearchParam requestParam) {
+        String collection = requestParam == null ? "" : requestParam.getCollectionName();
+        return recordLogicalOperation("HybridSearch", collection,
+                () -> retry(() -> super.hybridSearch(requestParam)));
+    }
+
+    @Override
+    public R<QueryResults> query(QueryParam requestParam) {
+        String collection = requestParam == null ? "" : requestParam.getCollectionName();
+        return recordLogicalOperation("Query", collection,
+                () -> retry(() -> super.query(requestParam)));
+    }
+
+    @Override
+    public ListenableFuture<R<MutationResult>> insertAsync(InsertParam requestParam) {
+        String collection = requestParam == null ? "" : requestParam.getCollectionName();
+        return recordLogicalOperationAsync("Insert", collection,
+                () -> super.insertAsync(requestParam));
+    }
+
+    @Override
+    public ListenableFuture<R<MutationResult>> upsertAsync(UpsertParam requestParam) {
+        String collection = requestParam == null ? "" : requestParam.getCollectionName();
+        return recordLogicalOperationAsync("Upsert", collection,
+                () -> super.upsertAsync(requestParam));
+    }
+
+    @Override
+    public ListenableFuture<R<SearchResults>> searchAsync(SearchParam requestParam) {
+        String collection = requestParam == null ? "" : requestParam.getCollectionName();
+        return recordLogicalOperationAsync("Search", collection,
+                () -> super.searchAsync(requestParam));
+    }
+
+    @Override
+    public ListenableFuture<R<SearchResults>> hybridSearchAsync(HybridSearchParam requestParam) {
+        String collection = requestParam == null ? "" : requestParam.getCollectionName();
+        return recordLogicalOperationAsync("HybridSearch", collection,
+                () -> super.hybridSearchAsync(requestParam));
+    }
+
+    @Override
+    public ListenableFuture<R<QueryResults>> queryAsync(QueryParam requestParam) {
+        String collection = requestParam == null ? "" : requestParam.getCollectionName();
+        return recordLogicalOperationAsync("Query", collection,
+                () -> super.queryAsync(requestParam));
+    }
+
+    @Override
+    public R<GetMetricsResponse> getMetrics(GetMetricsParam requestParam) {
+        return retry(() -> super.getMetrics(requestParam));
+    }
+
+    @Override
+    public R<GetFlushStateResponse> getFlushState(GetFlushStateParam requestParam) {
+        return retry(() -> super.getFlushState(requestParam));
+    }
+
+    @Override
+    public R<GetFlushAllStateResponse> getFlushAllState(GetFlushAllStateParam requestParam) {
+        return retry(() -> super.getFlushAllState(requestParam));
+    }
+
+    @Override
+    public R<GetPersistentSegmentInfoResponse> getPersistentSegmentInfo(GetPersistentSegmentInfoParam requestParam) {
+        return retry(() -> super.getPersistentSegmentInfo(requestParam));
+    }
+
+    @Override
+    public R<GetQuerySegmentInfoResponse> getQuerySegmentInfo(GetQuerySegmentInfoParam requestParam) {
+        return retry(() -> super.getQuerySegmentInfo(requestParam));
+    }
+
+    @Override
+    public R<GetReplicasResponse> getReplicas(GetReplicasParam requestParam) {
+        return retry(() -> super.getReplicas(requestParam));
+    }
+
+    @Override
+    public R<RpcStatus> loadBalance(LoadBalanceParam requestParam) {
+        return retry(() -> super.loadBalance(requestParam));
+    }
+
+    @Override
+    public R<GetCompactionStateResponse> getCompactionState(GetCompactionStateParam requestParam) {
+        return retry(() -> super.getCompactionState(requestParam));
+    }
+
+    @Override
+    public R<ManualCompactionResponse> manualCompact(ManualCompactParam requestParam) {
+        return retry(() -> super.manualCompact(requestParam));
+    }
+
+    @Override
+    public R<GetCompactionPlansResponse> getCompactionStateWithPlans(GetCompactionPlansParam requestParam) {
+        return retry(() -> super.getCompactionStateWithPlans(requestParam));
+    }
+
+    @Override
+    public R<RpcStatus> createCredential(CreateCredentialParam requestParam) {
+        return retry(() -> super.createCredential(requestParam));
+    }
+
+    @Override
+    public R<RpcStatus> updateCredential(UpdateCredentialParam requestParam) {
+        return retry(() -> super.updateCredential(requestParam));
+    }
+
+    @Override
+    public R<RpcStatus> deleteCredential(DeleteCredentialParam requestParam) {
+        return retry(() -> super.deleteCredential(requestParam));
+    }
+
+    @Override
+    public R<ListCredUsersResponse> listCredUsers(ListCredUsersParam requestParam) {
+        return retry(() -> super.listCredUsers(requestParam));
+    }
+
+
+    @Override
+    public R<RpcStatus> createRole(CreateRoleParam requestParam) {
+        return retry(() -> super.createRole(requestParam));
+    }
+
+
+    @Override
+    public R<RpcStatus> dropRole(DropRoleParam requestParam) {
+        return retry(() -> super.dropRole(requestParam));
+    }
+
+
+    @Override
+    public R<RpcStatus> addUserToRole(AddUserToRoleParam requestParam) {
+        return retry(() -> super.addUserToRole(requestParam));
+    }
+
+
+    @Override
+    public R<RpcStatus> removeUserFromRole(RemoveUserFromRoleParam requestParam) {
+        return retry(() -> super.removeUserFromRole(requestParam));
+    }
+
+
+    @Override
+    public R<SelectRoleResponse> selectRole(SelectRoleParam requestParam) {
+        return retry(() -> super.selectRole(requestParam));
+    }
+
+
+    @Override
+    public R<SelectUserResponse> selectUser(SelectUserParam requestParam) {
+        return retry(() -> super.selectUser(requestParam));
+    }
+
+
+    @Override
+    public R<RpcStatus> grantRolePrivilege(GrantRolePrivilegeParam requestParam) {
+        return retry(() -> super.grantRolePrivilege(requestParam));
+    }
+
+
+    @Override
+    public R<RpcStatus> revokeRolePrivilege(RevokeRolePrivilegeParam requestParam) {
+        return retry(() -> super.revokeRolePrivilege(requestParam));
+    }
+
+
+    @Override
+    public R<SelectGrantResponse> selectGrantForRole(SelectGrantForRoleParam requestParam) {
+        return retry(() -> super.selectGrantForRole(requestParam));
+    }
+
+
+    @Override
+    public R<SelectGrantResponse> selectGrantForRoleAndObject(SelectGrantForRoleAndObjectParam requestParam) {
+        return retry(() -> super.selectGrantForRoleAndObject(requestParam));
+    }
+
+    @Override
+    public R<ImportResponse> bulkInsert(BulkInsertParam requestParam) {
+        return retry(() -> super.bulkInsert(requestParam));
+    }
+
+    @Override
+    public R<GetImportStateResponse> getBulkInsertState(GetBulkInsertStateParam requestParam) {
+        return retry(() -> super.getBulkInsertState(requestParam));
+    }
+
+    @Override
+    public R<ListImportTasksResponse> listBulkInsertTasks(ListBulkInsertTasksParam requestParam) {
+        return retry(() -> super.listBulkInsertTasks(requestParam));
+    }
+
+    @Override
+    public R<CheckHealthResponse> checkHealth() {
+        return retry(super::checkHealth);
+    }
+
+    @Override
+    public R<GetVersionResponse> getVersion() {
+        return retry(super::getVersion);
+    }
+
+    @Override
+    public R<GetLoadingProgressResponse> getLoadingProgress(GetLoadingProgressParam requestParam) {
+        return retry(() -> super.getLoadingProgress(requestParam));
+    }
+
+    @Override
+    public R<GetLoadStateResponse> getLoadState(GetLoadStateParam requestParam) {
+        return retry(() -> super.getLoadState(requestParam));
+    }
+
+    @Override
+    public R<RpcStatus> createResourceGroup(CreateResourceGroupParam requestParam) {
+        return retry(() -> super.createResourceGroup(requestParam));
+    }
+
+    @Override
+    public R<RpcStatus> dropResourceGroup(DropResourceGroupParam requestParam) {
+        return retry(() -> super.dropResourceGroup(requestParam));
+    }
+
+    @Override
+    public R<ListResourceGroupsResponse> listResourceGroups(ListResourceGroupsParam requestParam) {
+        return retry(() -> super.listResourceGroups(requestParam));
+    }
+
+    @Override
+    public R<DescribeResourceGroupResponse> describeResourceGroup(DescribeResourceGroupParam requestParam) {
+        return retry(() -> super.describeResourceGroup(requestParam));
+    }
+
+    @Override
+    public R<RpcStatus> transferNode(TransferNodeParam requestParam) {
+        return retry(() -> super.transferNode(requestParam));
+    }
+
+    @Override
+    public R<RpcStatus> transferReplica(TransferReplicaParam requestParam) {
+        return retry(() -> super.transferReplica(requestParam));
+    }
+
+    @Override
+    public R<RpcStatus> updateResourceGroups(UpdateResourceGroupsParam requestParam) {
+        return retry(() -> super.updateResourceGroups(requestParam));
+    }
+
+    @Override
+    public R<RpcStatus> createCollection(CreateSimpleCollectionParam requestParam) {
+        return retry(() -> super.createCollection(requestParam));
+    }
+
+    @Override
+    public R<ListCollectionsResponse> listCollections(ListCollectionsParam requestParam) {
+        return retry(() -> super.listCollections(requestParam));
+    }
+
+    @Override
+    public R<InsertResponse> insert(InsertRowsParam requestParam) {
+        String collection = requestParam == null || requestParam.getInsertParam() == null
+                ? "" : requestParam.getInsertParam().getCollectionName();
+        return recordLogicalOperation("Insert", collection,
+                () -> retry(() -> super.insert(requestParam)));
+    }
+
+    @Override
+    public R<DeleteResponse> delete(DeleteIdsParam requestParam) {
+        String collection = requestParam == null ? "" : requestParam.getCollectionName();
+        return recordLogicalOperation("Delete", collection,
+                () -> retry(() -> super.delete(requestParam)));
+    }
+
+    @Override
+    public R<GetResponse> get(GetIdsParam requestParam) {
+        String collection = requestParam == null ? "" : requestParam.getCollectionName();
+        return recordLogicalOperation("Query", collection,
+                () -> retry(() -> super.get(requestParam)));
+    }
+
+    @Override
+    public R<QueryResponse> query(QuerySimpleParam requestParam) {
+        String collection = requestParam == null ? "" : requestParam.getCollectionName();
+        return recordLogicalOperation("Query", collection,
+                () -> retry(() -> super.query(requestParam)));
+    }
+
+    @Override
+    public R<SearchResponse> search(SearchSimpleParam requestParam) {
+        String collection = requestParam == null ? "" : requestParam.getCollectionName();
+        return recordLogicalOperation("Search", collection,
+                () -> retry(() -> super.search(requestParam)));
+    }
+
+    @Override
+    public R<QueryIterator> queryIterator(QueryIteratorParam requestParam) {
+        return retry(() -> super.queryIterator(requestParam));
+    }
+
+    @Override
+    public R<SearchIterator> searchIterator(SearchIteratorParam requestParam) {
+        return retry(() -> super.searchIterator(requestParam));
+    }
+}

@@ -1,0 +1,110 @@
+version: '3.5'
+
+services:
+  etcd1:
+    container_name: milvus-javasdk-etcd-1
+    image: quay.io/coreos/etcd:v3.5.25
+    environment:
+      - ETCD_AUTO_COMPACTION_MODE=revision
+      - ETCD_AUTO_COMPACTION_RETENTION=1000
+      - ETCD_QUOTA_BACKEND_BYTES=4294967296
+      - ETCD_SNAPSHOT_COUNT=50000
+    command: etcd -advertise-client-urls=http://etcd1:12379 -listen-client-urls http://0.0.0.0:12379 --data-dir /etcd
+    healthcheck:
+      test: ["CMD", "etcdctl", "--endpoints=http://localhost:12379", "endpoint", "health"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+
+  minio1:
+    container_name: milvus-javasdk-minio-1
+    image: milvusdb/minio:RELEASE.2024-05-28T17-19-04Z
+    environment:
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+    command: minio server /minio_data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+
+  standalone:
+    container_name: milvus-javasdk-standalone-1
+    image: milvusdb/milvus:master-20260825-dd1ee671
+    user: "0:0"
+    command: ["milvus", "run", "standalone"]
+    security_opt:
+    - seccomp:unconfined
+    environment:
+      ETCD_ENDPOINTS: etcd1:12379
+      MINIO_ADDRESS: minio1:9000
+      MQ_TYPE: woodpecker
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      interval: 30s
+      start_period: 90s
+      timeout: 20s
+      retries: 3
+    ports:
+      - "29530:19530"
+      - "19091:9091"
+    depends_on:
+      - "etcd1"
+      - "minio1"
+
+  etcd2:
+    container_name: milvus-javasdk-etcd-2
+    image: quay.io/coreos/etcd:v3.5.25
+    environment:
+      - ETCD_AUTO_COMPACTION_MODE=revision
+      - ETCD_AUTO_COMPACTION_RETENTION=1000
+      - ETCD_QUOTA_BACKEND_BYTES=4294967296
+      - ETCD_SNAPSHOT_COUNT=50000
+    command: etcd -advertise-client-urls=http://etcd2:12379 -listen-client-urls http://0.0.0.0:12379 --data-dir /etcd
+    healthcheck:
+      test: ["CMD", "etcdctl", "--endpoints=http://localhost:12379", "endpoint", "health"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+
+  minio2:
+    container_name: milvus-javasdk-minio-2
+    image: milvusdb/minio:RELEASE.2024-05-28T17-19-04Z
+    environment:
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+    command: minio server /minio_data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+
+  standaloneslave:
+    container_name: milvus-javasdk-standalone-2
+    image: milvusdb/milvus:master-20260825-dd1ee671
+    user: "0:0"
+    command: ["milvus", "run", "standalone"]
+    security_opt:
+    - seccomp:unconfined
+    environment:
+      ETCD_ENDPOINTS: etcd2:12379
+      MINIO_ADDRESS: minio2:9000
+      MQ_TYPE: woodpecker
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      interval: 30s
+      start_period: 90s
+      timeout: 20s
+      retries: 3
+    ports:
+      - "29531:19530"
+      - "19092:9091"
+    depends_on:
+      - "etcd2"
+      - "minio2"
+
+networks:
+  default:
+    name: test-milvus

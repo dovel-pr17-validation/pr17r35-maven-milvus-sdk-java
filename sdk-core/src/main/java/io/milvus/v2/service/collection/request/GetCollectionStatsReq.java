@@ -1,0 +1,148 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+package io.milvus.v2.service.collection.request;
+
+/**
+ * Request parameters for the {@code getCollectionStats} API.
+ */
+
+
+public class GetCollectionStatsReq {
+    private String databaseName;
+    private String collectionName;
+
+    private GetCollectionStatsReq(GetCollectionStatsReqBuilder builder) {
+        this.databaseName = builder.databaseName;
+        this.collectionName = builder.collectionName;
+    }
+
+    /**
+     * Returns the database name.
+     *
+     * @return the database name
+     */
+
+
+    public String getDatabaseName() {
+        return databaseName;
+    }
+
+    /**
+     * Sets the database name.
+     *
+     * @param databaseName the database name
+     */
+
+
+    public void setDatabaseName(String databaseName) {
+        this.databaseName = databaseName;
+    }
+
+    /**
+     * Returns the collection name.
+     *
+     * @return the collection name
+     */
+
+
+    public String getCollectionName() {
+        return collectionName;
+    }
+
+    /**
+     * Sets the collection name.
+     *
+     * @param collectionName the collection name
+     */
+
+
+    public void setCollectionName(String collectionName) {
+        this.collectionName = collectionName;
+    }
+
+    @Override
+    public String toString() {
+        return "GetCollectionStatsReq{" +
+                "databaseName='" + databaseName + '\'' +
+                ", collectionName='" + collectionName + '\'' +
+                '}';
+    }
+
+    /**
+     * Creates a new builder for {@link GetCollectionStatsReq}.
+     *
+     * @return the builder
+     */
+
+
+    public static GetCollectionStatsReqBuilder builder() {
+        return new GetCollectionStatsReqBuilder();
+    }
+
+    /**
+     * Builder for {@link GetCollectionStatsReq} class.
+     */
+
+
+    public static class GetCollectionStatsReqBuilder {
+        private String databaseName;
+        private String collectionName;
+
+        private GetCollectionStatsReqBuilder() {
+        }
+
+        /**
+         * Sets the database name.
+         *
+         * @param databaseName the database name
+         * @return this builder
+         */
+
+
+        public GetCollectionStatsReqBuilder databaseName(String databaseName) {
+            this.databaseName = databaseName;
+            return this;
+        }
+
+        /**
+         * Sets the collection name.
+         *
+         * @param collectionName the collection name
+         * @return this builder
+         */
+
+
+        public GetCollectionStatsReqBuilder collectionName(String collectionName) {
+            this.collectionName = collectionName;
+            return this;
+        }
+
+        /**
+         * Builds a {@link GetCollectionStatsReq} with the configured parameters.
+         *
+         * @return the request
+         */
+
+
+        public GetCollectionStatsReq build() {
+            return new GetCollectionStatsReq(this);
+        }
+    }
+}

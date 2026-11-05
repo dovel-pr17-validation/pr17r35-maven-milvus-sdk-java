@@ -1,0 +1,292 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+package io.milvus.common.resourcegroup;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.stream.Collectors;
+
+/**
+ * Describes the configuration of a resource group, including requested and limited node counts,
+ * node transfers from/to other groups, and an optional node label filter. Supports conversion
+ * to and from the gRPC representation.
+ */
+
+
+public class ResourceGroupConfig {
+    private final ResourceGroupLimit requests;
+    private final ResourceGroupLimit limits;
+    private final List<ResourceGroupTransfer> from;
+    private final List<ResourceGroupTransfer> to;
+    private final ResourceGroupNodeFilter nodeFilter;
+
+    private ResourceGroupConfig(Builder builder) {
+        this.requests = builder.requests;
+        this.limits = builder.limits;
+        this.nodeFilter = builder.nodeFilter;
+
+        if (null == builder.from) {
+            this.from = new ArrayList<>();
+        } else {
+            this.from = builder.from;
+        }
+
+        if (null == builder.to) {
+            this.to = new ArrayList<>();
+        } else {
+            this.to = builder.to;
+        }
+    }
+
+    /**
+     * Creates a new {@link ResourceGroupConfig} builder.
+     *
+     * @return a new builder
+     */
+
+
+    public static Builder newBuilder() {
+        return new Builder();
+    }
+
+    /**
+     * Builder for {@link ResourceGroupConfig} class.
+     */
+
+
+    public static final class Builder {
+        private ResourceGroupLimit requests;
+        private ResourceGroupLimit limits;
+        private List<ResourceGroupTransfer> from;
+        private List<ResourceGroupTransfer> to;
+        private ResourceGroupNodeFilter nodeFilter;
+
+        private Builder() {
+        }
+
+        /**
+         * Set the requests node num.
+         *
+         * @param requests requests node num in resource group, if node num is less than requests.nodeNum, it will be transfer from other resource group.
+         * @return <code>Builder</code>
+         */
+
+
+        public Builder withRequests(ResourceGroupLimit requests) {
+            if (requests == null) {
+                throw new IllegalArgumentException("requests cannot be null");
+            }
+            this.requests = requests;
+            return this;
+        }
+
+        /**
+         * Set the limited node num.
+         *
+         * @param limits limited node num in resource group, if node num is more than limits.nodeNum, it will be transfer to other resource group.
+         * @return <code>Builder</code>
+         */
+
+
+        public Builder withLimits(ResourceGroupLimit limits) {
+            if (limits == null) {
+                throw new IllegalArgumentException("limits cannot be null");
+            }
+            this.limits = limits;
+            return this;
+        }
+
+        /**
+         * Set the transfer from list.
+         *
+         * @param from missing node should be transfer from given resource group at high priority in repeated list.
+         * @return <code>Builder</code>
+         */
+
+
+        public Builder withFrom(List<ResourceGroupTransfer> from) {
+            if (from == null) {
+                throw new IllegalArgumentException("from cannot be null");
+            }
+            this.from = from;
+            return this;
+        }
+
+        /**
+         * Set the transfer to list.
+         *
+         * @param to redundant node should be transfer to given resource group at high priority in repeated list.
+         * @return <code>Builder</code>
+         */
+
+
+        public Builder withTo(List<ResourceGroupTransfer> to) {
+            if (to == null) {
+                throw new IllegalArgumentException("to cannot be null");
+            }
+            this.to = to;
+            return this;
+        }
+
+        /**
+         * Set the node filter.
+         *
+         * @param nodeFilter if node filter set, resource group will prefer to accept node which match node filter.
+         * @return <code>Builder</code>
+         */
+
+
+        public Builder withNodeFilter(ResourceGroupNodeFilter nodeFilter) {
+            if (nodeFilter == null) {
+                throw new IllegalArgumentException("nodeFilter cannot be null");
+            }
+            this.nodeFilter = nodeFilter;
+            return this;
+        }
+
+        /**
+         * Builds the {@link ResourceGroupConfig} instance.
+         *
+         * @return the built resource group config
+         */
+
+
+        public ResourceGroupConfig build() {
+            return new ResourceGroupConfig(this);
+        }
+    }
+
+    /**
+     * Creates a resource group config from its gRPC representation.
+     *
+     * @param grpcConfig the gRPC resource group config, must not be {@code null}
+     */
+
+
+    public ResourceGroupConfig(io.milvus.grpc.ResourceGroupConfig grpcConfig) {
+        if (grpcConfig == null) {
+            throw new IllegalArgumentException("grpcConfig cannot be null");
+        }
+        this.requests = new ResourceGroupLimit(grpcConfig.getRequests());
+        this.limits = new ResourceGroupLimit(grpcConfig.getLimits());
+        this.from = grpcConfig.getTransferFromList().stream()
+                .map(transfer -> new ResourceGroupTransfer(transfer))
+                .collect(Collectors.toList());
+        this.to = grpcConfig.getTransferToList().stream()
+                .map(transfer -> new ResourceGroupTransfer(transfer))
+                .collect(Collectors.toList());
+        this.nodeFilter = new ResourceGroupNodeFilter(grpcConfig.getNodeFilter());
+    }
+
+    /**
+     * Returns the requested node count limit of the resource group.
+     *
+     * @return the requested node limit
+     */
+
+
+    public ResourceGroupLimit getRequests() {
+        return requests;
+    }
+
+    /**
+     * Returns the limited node count of the resource group.
+     *
+     * @return the node limit
+     */
+
+
+    public ResourceGroupLimit getLimits() {
+        return limits;
+    }
+
+    /**
+     * Returns the list of resource groups to transfer missing nodes from, in priority order.
+     *
+     * @return the transfer-from list
+     */
+
+
+    public List<ResourceGroupTransfer> getFrom() {
+        return from;
+    }
+
+    /**
+     * Returns the list of resource groups to transfer redundant nodes to, in priority order.
+     *
+     * @return the transfer-to list
+     */
+
+
+    public List<ResourceGroupTransfer> getTo() {
+        return to;
+    }
+
+    /**
+     * Returns the node label filter of the resource group, if any.
+     *
+     * @return the node filter, or {@code null} if none is set
+     */
+
+
+    public ResourceGroupNodeFilter getNodeFilter() {
+        return nodeFilter;
+    }
+
+    /**
+     * Converts this config into its gRPC representation.
+     *
+     * @return the gRPC resource group config
+     */
+
+
+    public io.milvus.grpc.ResourceGroupConfig toGRPC() {
+        io.milvus.grpc.ResourceGroupConfig.Builder builder = io.milvus.grpc.ResourceGroupConfig.newBuilder()
+                .setRequests(io.milvus.grpc.ResourceGroupLimit.newBuilder().setNodeNum(requests.getNodeNum()))
+                .setLimits(io.milvus.grpc.ResourceGroupLimit.newBuilder().setNodeNum(limits.getNodeNum()));
+
+        if (from != null) {
+            for (ResourceGroupTransfer transfer : from) {
+                builder.addTransferFrom(transfer.toGRPC());
+            }
+        }
+        if (to != null) {
+            for (ResourceGroupTransfer transfer : to) {
+                builder.addTransferTo(transfer.toGRPC());
+            }
+        }
+        if (nodeFilter != null) {
+            builder.setNodeFilter(nodeFilter.toGRPC());
+        }
+
+        return builder.build();
+    }
+
+    @Override
+    public String toString() {
+        return "ResourceGroupConfig{" +
+                "requests=" + requests +
+                ", limits=" + limits +
+                ", from=" + from +
+                ", to=" + to +
+                ", nodeFilter=" + nodeFilter +
+                '}';
+    }
+}
